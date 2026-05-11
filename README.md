@@ -71,6 +71,7 @@ Copy `.env.example` to `.env`, then set:
 - `ENABLE_MIMIC_COMMAND`: set `true` to enable disclosed style mimicry with `!mimic`/`!unmimic` (default `false`)
 - `MIMIC_COMMAND`: command to start mimic mode in the current channel (default `!mimic`)
 - `UNMIMIC_COMMAND`: command to stop mimic mode in the current channel (default `!unmimic`)
+- `MIMIC_RATE_LIMIT_COMMAND`: command to view or update the current channel's active mimic cooldown (default `!mimicrate`)
 - `MIMIC_COMMAND_REQUIRES_ADMIN`: if `true`, only members with `Manage Server` can use mimic commands (default `false`)
 - `MIMIC_DATA_DIR`: folder where persistent mimic profiles/examples are stored (default `mimic_data`)
 - `MIMIC_MODEL`: Groq model for mimic profile updates and reply decisions (default matches `GIF_GROQ_MODEL`)
@@ -79,11 +80,15 @@ Copy `.env.example` to `.env`, then set:
 - `MIMIC_CONTEXT_MESSAGE_LIMIT`: recent human messages used as live conversation context (default `14`)
 - `MIMIC_RECENT_EXCHANGE_LIMIT`: recent mimic-bot exchanges remembered and included in the prompt (default `8`)
 - `MIMIC_FOLLOWUP_WINDOW_MS`: how long a same-user follow-up after a mimic reply bypasses the normal cooldown (default `180000`)
+- `MIMIC_IMPLICIT_FOLLOWUP_WINDOW_MS`: stricter window for non-reply messages to count as implicit follow-ups (default `45000`)
+- `MIMIC_THREAD_LOCK_MS`: how long mimic mode stays in one active conversation lane before pivoting to unrelated chatter (default `30000`; `0` disables)
 - `MIMIC_REPLY_COOLDOWN_MS`: minimum time between mimic replies unless directly triggered (default `5000`)
 - `MIMIC_REPLY_MAX_CHARS`: max generated mimic text before the disclosure prefix (default `500`)
 - `MIMIC_TEMPERATURE`: creativity for mimic profile/reply generation, from `0` to `2` (default `0.75`)
 - `MIMIC_STYLE_MATCH_MIN`: minimum model-rated tone/style match before auto-replying, from `0` to `1` (default `0.65`)
 - `MIMIC_ORIGINALITY_MIN`: minimum model-rated originality before auto-replying, from `0` to `1` (default `0.45`)
+- `MIMIC_AUTO_REPLY_CONFIDENCE_MIN`: minimum model confidence for ordinary auto-replies (default `0.72`)
+- `MIMIC_FOLLOWUP_REPLY_CONFIDENCE_MIN`: minimum model confidence for eligible implicit follow-up replies (default `0.65`)
 - `MIMIC_MAX_EXAMPLES`: max stored example messages per user profile (default `250`)
 - `MIMIC_PROFILE_UPDATE_EXAMPLE_COUNT`: new examples needed before refreshing the persistent profile summary (default `12`)
 - `MIMIC_EARLY_PROFILE_EXAMPLE_COUNT`: until this many stored examples exist, refresh the profile more aggressively (default `50`)
@@ -179,6 +184,8 @@ Set `ENABLE_MIMIC_COMMAND=true` and make sure `GROQ_API_KEY` is configured.
 - Send `!mimic @user` to start disclosed style mimicry for that user in the current channel.
 - Send `!mimic` as a reply to one of someone's messages to mimic that message's author.
 - Send `!unmimic` to stop mimic mode in the current channel.
+- Send `!mimicrate` to see the active mimic cooldown in the current channel.
+- Send `!mimicrate 5s`, `!mimicrate 2500ms`, `!mimicrate 2m`, or `!mimicrate off` to change that active session's cooldown without restarting the bot.
 
 When mimic mode starts, the bot scans recent channel messages from the target user, stores examples and a rolling style profile in `MIMIC_DATA_DIR`, and keeps that data across `!unmimic`/`!mimic` cycles. While active, it keeps learning from real messages by the target user.
 
@@ -192,9 +199,15 @@ The mimic prompt treats stored examples as style evidence, not templates. It ask
 
 While a mimic session is active, the bot also remembers its own recent mimic replies in memory. Those exchanges are included in later prompts so it can avoid repeating itself, carry forward what it just said, and handle multi-message follow-ups from a user it recently answered.
 
+Implicit follow-ups are intentionally strict. A normal next message from someone the bot just answered no longer bypasses cooldown by itself; it has to look like a real continuation, such as a follow-up question, clarification request, mention, or direct reference. Mimic mode also keeps a short active conversation lane with `MIMIC_THREAD_LOCK_MS` so it does not interject into every simultaneous subthread.
+
+Mimic mode treats bot-management chatter as non-conversational. Messages about the bot, mimic model, cooldown, rate limit, spam, or `!unmimic` are skipped unless someone directly replies to the mimic bot or mentions the mimicked user.
+
 For multilingual chat, mimic mode routes messages written in non-English scripts, including Chinese, to `MIMIC_MULTILINGUAL_MODEL` and tells the model to understand and usually answer in the same language/script. It also retries once if the proposed reply is too similar to one it recently sent, then skips rather than posting the same line again.
 
 If someone replies directly to one of the bot's mimic messages, that bypasses `MIMIC_REPLY_COOLDOWN_MS`; the bot treats the reply as a direct prompt and answers as the mimicked user with the disclosure prefix. If the same user sends another message within `MIMIC_FOLLOWUP_WINDOW_MS`, the bot treats it as a possible continuation of that exchange and can answer without waiting for the normal cooldown.
+
+`MIMIC_REPLY_COOLDOWN_MS` is the startup/default cooldown. `!mimicrate` overrides it only for the active mimic session in the current channel.
 
 ## Nickname behavior
 
@@ -235,9 +248,12 @@ If someone replies directly to one of the bot's mimic messages, that bypasses `M
   - `argue_session_ended`: argument mode stopped
   - `argue_command_failed`: argument mode failed to start or stop cleanly
   - `mimic_session_started`: mimic mode started and profile examples were loaded
+  - `mimic_rate_limit_updated`: mimic mode cooldown was changed with `!mimicrate`
   - `mimic_profile_updated`: persistent mimic profile summary was refreshed
   - `mimic_target_message_learned`: mimic mode saved a new message from the real target user
   - `mimic_reply_sent`: mimic mode sent a disclosed style-simulation reply
+  - `mimic_reply_skipped_management_chatter`: mimic mode ignored bot/model/rate-limit chatter
+  - `mimic_reply_skipped_thread_lock`: mimic mode stayed out of an unrelated subthread while another conversation lane was active
   - `mimic_reply_skipped_by_model`: mimic mode decided not to interrupt the conversation
   - `mimic_followup_skipped_by_model`: a same-user follow-up bypassed cooldown, but the model judged it should not answer
   - `mimic_repetitive_reply_retried`: a proposed mimic reply matched a recent bot reply, so the bot asked once for a different answer

@@ -146,6 +146,9 @@ const ENABLE_MIMIC_COMMAND =
   (process.env.ENABLE_MIMIC_COMMAND ?? "false") === "true";
 const MIMIC_COMMAND = (process.env.MIMIC_COMMAND ?? "!mimic").trim();
 const UNMIMIC_COMMAND = (process.env.UNMIMIC_COMMAND ?? "!unmimic").trim();
+const MIMIC_RATE_LIMIT_COMMAND = (
+  process.env.MIMIC_RATE_LIMIT_COMMAND ?? "!mimicrate"
+).trim();
 const MIMIC_COMMAND_REQUIRES_ADMIN =
   (process.env.MIMIC_COMMAND_REQUIRES_ADMIN ?? "false") === "true";
 const MIMIC_DATA_DIR = process.env.MIMIC_DATA_DIR ?? "mimic_data";
@@ -165,6 +168,12 @@ const MIMIC_RECENT_EXCHANGE_LIMIT = Number(
 const MIMIC_FOLLOWUP_WINDOW_MS = Number(
   process.env.MIMIC_FOLLOWUP_WINDOW_MS ?? "180000"
 );
+const MIMIC_IMPLICIT_FOLLOWUP_WINDOW_MS = Number(
+  process.env.MIMIC_IMPLICIT_FOLLOWUP_WINDOW_MS ?? "45000"
+);
+const MIMIC_THREAD_LOCK_MS = Number(
+  process.env.MIMIC_THREAD_LOCK_MS ?? "30000"
+);
 const MIMIC_REPLY_COOLDOWN_MS = Number(
   process.env.MIMIC_REPLY_COOLDOWN_MS ?? "5000"
 );
@@ -177,6 +186,12 @@ const MIMIC_STYLE_MATCH_MIN = Number(
 );
 const MIMIC_ORIGINALITY_MIN = Number(
   process.env.MIMIC_ORIGINALITY_MIN ?? "0.45"
+);
+const MIMIC_AUTO_REPLY_CONFIDENCE_MIN = Number(
+  process.env.MIMIC_AUTO_REPLY_CONFIDENCE_MIN ?? "0.72"
+);
+const MIMIC_FOLLOWUP_REPLY_CONFIDENCE_MIN = Number(
+  process.env.MIMIC_FOLLOWUP_REPLY_CONFIDENCE_MIN ?? "0.65"
 );
 const MIMIC_MAX_EXAMPLES = Number(process.env.MIMIC_MAX_EXAMPLES ?? "250");
 const MIMIC_PROFILE_UPDATE_EXAMPLE_COUNT = Number(
@@ -462,9 +477,12 @@ if (
   process.exit(1);
 }
 
-if (ENABLE_MIMIC_COMMAND && (!MIMIC_COMMAND || !UNMIMIC_COMMAND)) {
+if (
+  ENABLE_MIMIC_COMMAND &&
+  (!MIMIC_COMMAND || !UNMIMIC_COMMAND || !MIMIC_RATE_LIMIT_COMMAND)
+) {
   console.error(
-    "ENABLE_MIMIC_COMMAND is true but MIMIC_COMMAND or UNMIMIC_COMMAND is empty."
+    "ENABLE_MIMIC_COMMAND is true but a mimic command name is empty."
   );
   process.exit(1);
 }
@@ -494,6 +512,12 @@ if (
   Number.isNaN(MIMIC_FOLLOWUP_WINDOW_MS) ||
   MIMIC_FOLLOWUP_WINDOW_MS < 10_000 ||
   MIMIC_FOLLOWUP_WINDOW_MS > 3_600_000 ||
+  Number.isNaN(MIMIC_IMPLICIT_FOLLOWUP_WINDOW_MS) ||
+  MIMIC_IMPLICIT_FOLLOWUP_WINDOW_MS < 5_000 ||
+  MIMIC_IMPLICIT_FOLLOWUP_WINDOW_MS > 600_000 ||
+  Number.isNaN(MIMIC_THREAD_LOCK_MS) ||
+  MIMIC_THREAD_LOCK_MS < 0 ||
+  MIMIC_THREAD_LOCK_MS > 600_000 ||
   Number.isNaN(MIMIC_REPLY_COOLDOWN_MS) ||
   MIMIC_REPLY_COOLDOWN_MS < 5_000 ||
   MIMIC_REPLY_COOLDOWN_MS > 600_000 ||
@@ -509,6 +533,12 @@ if (
   Number.isNaN(MIMIC_ORIGINALITY_MIN) ||
   MIMIC_ORIGINALITY_MIN < 0 ||
   MIMIC_ORIGINALITY_MIN > 1 ||
+  Number.isNaN(MIMIC_AUTO_REPLY_CONFIDENCE_MIN) ||
+  MIMIC_AUTO_REPLY_CONFIDENCE_MIN < 0 ||
+  MIMIC_AUTO_REPLY_CONFIDENCE_MIN > 1 ||
+  Number.isNaN(MIMIC_FOLLOWUP_REPLY_CONFIDENCE_MIN) ||
+  MIMIC_FOLLOWUP_REPLY_CONFIDENCE_MIN < 0 ||
+  MIMIC_FOLLOWUP_REPLY_CONFIDENCE_MIN > 1 ||
   Number.isNaN(MIMIC_MAX_EXAMPLES) ||
   MIMIC_MAX_EXAMPLES < 20 ||
   MIMIC_MAX_EXAMPLES > 2000 ||
@@ -739,12 +769,28 @@ function isUnmimicCommandMessage(content) {
   );
 }
 
+function isMimicRateLimitCommandMessage(content) {
+  if (!ENABLE_MIMIC_COMMAND) return false;
+  if (!content?.trim()) return false;
+
+  const normalizedContent = content.trim().toLowerCase();
+  const normalizedCommand = MIMIC_RATE_LIMIT_COMMAND.toLowerCase();
+  return (
+    normalizedContent === normalizedCommand ||
+    normalizedContent.startsWith(`${normalizedCommand} `)
+  );
+}
+
 function parseMimicCommandInput(content) {
   return content.trim().slice(MIMIC_COMMAND.length).trim();
 }
 
 function parseUnmimicCommandInput(content) {
   return content.trim().slice(UNMIMIC_COMMAND.length).trim();
+}
+
+function parseMimicRateLimitCommandInput(content) {
+  return content.trim().slice(MIMIC_RATE_LIMIT_COMMAND.length).trim();
 }
 
 function isUserAllowedToPromptBot(userId) {
@@ -2441,6 +2487,10 @@ function ensureMimicSessionMemory(session) {
   if (!(session.recentRepliesByUserId instanceof Map)) {
     session.recentRepliesByUserId = new Map();
   }
+
+  if (!session.activeMimicThread || typeof session.activeMimicThread !== "object") {
+    session.activeMimicThread = null;
+  }
 }
 
 function buildMimicRecentExchangeTranscript(session, currentMessage) {
@@ -2490,6 +2540,137 @@ function getRecentMimicReplyForUser(session, userId, now = Date.now()) {
   return exchange;
 }
 
+function isLowContentMimicFollowupText(content) {
+  const normalized = String(content ?? "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!normalized) return true;
+  if (/^[!?.,;:()\[\]{}'"“”‘’\-\s]+$/.test(normalized)) return true;
+
+  const lowContentPhrases = new Set([
+    "lol",
+    "lmao",
+    "lmfao",
+    "wtf",
+    "bro",
+    "bruh",
+    "huh",
+    "what",
+    "ok",
+    "okay",
+    "nvm",
+    "nevermind",
+    "real",
+    "true",
+    "same",
+    "????",
+    "??",
+    "!!"
+  ]);
+
+  return lowContentPhrases.has(normalized);
+}
+
+function messageLooksLikeImplicitMimicFollowup(message, exchange, session) {
+  const content = message.content?.replace(/\s+/g, " ").trim() ?? "";
+  if (isLowContentMimicFollowupText(content)) return false;
+
+  const lowerContent = content.toLowerCase();
+  const previousReply = String(exchange?.replyText ?? "").toLowerCase();
+
+  if (
+    message.mentions.users.has(client.user.id) ||
+    message.mentions.users.has(session.targetUserId) ||
+    contentIncludesTerm(lowerContent, session.targetDisplayName) ||
+    contentIncludesTerm(lowerContent, session.targetUsername)
+  ) {
+    return true;
+  }
+
+  if (
+    /\b(what about|wdym|what do you mean|what do u mean|why|how|explain|elaborate|answer|respond|reply)\b/i.test(
+      content
+    )
+  ) {
+    return true;
+  }
+
+  if (
+    /\?$/.test(content) &&
+    !/\b(this bot|the bot|ur bot|your bot|mimic model|rate limit|reduce|unmimic|mimicrate)\b/i.test(
+      content
+    )
+  ) {
+    return true;
+  }
+
+  const contentTokens = tokenizeForSimilarity(content);
+  const previousTokens = tokenizeForSimilarity(previousReply);
+  let shared = 0;
+  contentTokens.forEach((token) => {
+    if (previousTokens.has(token)) shared += 1;
+  });
+
+  return shared >= 2 && content.length <= 220;
+}
+
+function getEligibleImplicitMimicFollowup(session, message) {
+  const exchange = getRecentMimicReplyForUser(session, message.author.id);
+  if (!exchange) return null;
+
+  const ageMs = Date.now() - Number(exchange.ts ?? 0);
+  if (ageMs > Math.min(MIMIC_FOLLOWUP_WINDOW_MS, MIMIC_IMPLICIT_FOLLOWUP_WINDOW_MS)) {
+    return null;
+  }
+
+  return messageLooksLikeImplicitMimicFollowup(message, exchange, session)
+    ? exchange
+    : null;
+}
+
+function getActiveMimicThread(session, now = Date.now()) {
+  ensureMimicSessionMemory(session);
+
+  const activeThread = session.activeMimicThread;
+  if (!activeThread) return null;
+  if (MIMIC_THREAD_LOCK_MS === 0) return null;
+  if (now - Number(activeThread.updatedAt ?? 0) > MIMIC_THREAD_LOCK_MS) {
+    session.activeMimicThread = null;
+    return null;
+  }
+
+  return activeThread;
+}
+
+function messageCanInterruptActiveMimicThread(message, session) {
+  return (
+    message.mentions.users.has(client.user.id) ||
+    message.mentions.users.has(session.targetUserId) ||
+    messageLooksLikeMimicTrigger(message, session)
+  );
+}
+
+function messageLooksLikeMimicManagementChatter(message) {
+  const content = message.content?.replace(/\s+/g, " ").trim().toLowerCase();
+  if (!content) return false;
+
+  return /\b(bot|mimic|miic|model|rate limit|cooldown|unmimic|mimicrate|spam|spamming|annoying|unusable|responds|responses)\b/i.test(
+    content
+  ) || /\breduce\b.*\b(respond|reply|rate|cooldown)\b/i.test(content);
+}
+
+function updateActiveMimicThread(session, exchange) {
+  ensureMimicSessionMemory(session);
+  session.activeMimicThread = {
+    userId: exchange.triggerUserId,
+    userName: exchange.triggerUserName,
+    updatedAt: exchange.ts,
+    replyMessageId: exchange.replyMessageId
+  };
+}
+
 function rememberMimicExchange({
   session,
   triggerMessage,
@@ -2522,6 +2703,7 @@ function rememberMimicExchange({
   }
 
   session.recentRepliesByUserId.set(triggerMessage.author.id, exchange);
+  updateActiveMimicThread(session, exchange);
   return exchange;
 }
 
@@ -2567,6 +2749,7 @@ async function buildMimicConversationContext(
     recentUserFollowup,
     currentAuthorIsTarget:
       session?.targetUserId === message.author.id,
+    activeMimicThread: session ? getActiveMimicThread(session) : null,
     recentExchangeTranscript: session
       ? buildMimicRecentExchangeTranscript(session, message)
       : "(none)"
@@ -2623,6 +2806,10 @@ function buildMimicDecisionPrompt({
     "Never claim to be the real person, never imply the real person said this, and never reveal private facts.",
     "Decide whether a simulated contribution would naturally help the active conversation.",
     "Reply only when there is an active conversational opening: a question, direct prompt, joke setup, disagreement, or a moment where this user's style would add something.",
+    "Default to staying quiet. A real person does not answer every nearby message or every topic shift.",
+    "Participate in one conversational lane at a time. Do not chase multiple unrelated subthreads in the same minute.",
+    "Natural pivoting means waiting until the current thread has gone quiet or the new message directly invites this persona. Do not pivot just because a new topic appeared.",
+    "If people are discussing the bot, the mimic model, rate limits, commands, or how annoying the bot is, usually stay quiet unless directly addressed by reply or mention.",
     "Have some agency: if replying, make a fresh conversational move. React, answer, tease, disagree, ask a short follow-up, or add a relevant opinion the target user might plausibly add.",
     "Do not merely retrieve an old example, summarize the chat, or parrot a catchphrase. Style examples are evidence, not templates.",
     "Tone fit matters more than topic fit: match their usual brevity, lowercase/all-caps habits, typo/slang density, punctuation, directness, and emotional intensity.",
@@ -2636,8 +2823,8 @@ function buildMimicDecisionPrompt({
       ? "The newest message is directly replying to the previous mimic-bot message shown below. Treat this as a direct prompt and answer it in the target user's style."
       : "No direct reply to a previous mimic-bot message is present.",
     recentUserFollowup
-      ? "The newest message is from a user the mimic bot recently answered. Treat it as a continuing thread or multi-message request from that same user, even if Discord did not mark it as a reply."
-      : "No recent same-user follow-up to a mimic-bot answer is present.",
+      ? "The newest message passed a strict implicit follow-up filter for a user the mimic bot recently answered. It may be a continuing thread, but still reply only if the target user would naturally answer."
+      : "No eligible same-user implicit follow-up to a mimic-bot answer is present.",
     context.currentAuthorIsTarget
       ? "The newest message is from the real target user being simulated. You may still reply to them as a normal participant; do not ignore them just because they are the target."
       : "The newest message is not from the real target user.",
@@ -2660,6 +2847,11 @@ function buildMimicDecisionPrompt({
     `Target user to stylistically simulate: ${profile.displayName} (@${profile.username}) [id=${profile.userId}]`,
     `Newest message uses non-English script: ${context.currentMessageUsesNonEnglishScript ? "yes" : "no"}`,
     `Recent transcript uses non-English script: ${context.transcriptUsesNonEnglishScript ? "yes" : "no"}`,
+    `Active mimic thread: ${
+      context.activeMimicThread
+        ? `${context.activeMimicThread.userName} [id=${context.activeMimicThread.userId}]`
+        : "(none)"
+    }`,
     `Measured writing style: ${formatMimicStyleMetrics(styleMetrics)}`,
     `Persistent profile: ${profile.profileSummary || "(not enough data yet)"}`,
     `Style notes: ${profile.styleNotes.join("; ") || "(none)"}`,
@@ -2722,6 +2914,96 @@ function getMimicDisclosurePrefix(displayName) {
 function formatMimicReply(session, replyText) {
   const prefix = getMimicDisclosurePrefix(session.targetDisplayName);
   return `${prefix}${replyText}`.slice(0, 2000);
+}
+
+function getMimicReplyCooldownMs(session) {
+  const sessionCooldown = Number(session?.replyCooldownMs);
+  return Number.isFinite(sessionCooldown)
+    ? sessionCooldown
+    : MIMIC_REPLY_COOLDOWN_MS;
+}
+
+function parseDurationMs(input) {
+  const raw = String(input ?? "").trim().toLowerCase();
+  if (!raw) return null;
+  if (["off", "none", "disable", "disabled", "no", "0"].includes(raw)) {
+    return 0;
+  }
+
+  const match = raw.match(/^(\d+(?:\.\d+)?)\s*(ms|msec|millisecond|milliseconds|s|sec|second|seconds|m|min|minute|minutes)?$/i);
+  if (!match) return null;
+
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount) || amount < 0) return null;
+
+  const unit = match[2] ?? "ms";
+  const minuteUnits = new Set(["m", "min", "minute", "minutes"]);
+  const secondUnits = new Set(["s", "sec", "second", "seconds"]);
+  const multiplier = minuteUnits.has(unit)
+    ? 60_000
+    : secondUnits.has(unit)
+      ? 1_000
+      : 1;
+
+  return Math.round(amount * multiplier);
+}
+
+function formatDuration(ms) {
+  if (ms === 0) return "off";
+  if (ms % 60_000 === 0) return `${ms / 60_000}m`;
+  if (ms % 1_000 === 0) return `${ms / 1_000}s`;
+  return `${ms}ms`;
+}
+
+async function setMimicRateLimit(message) {
+  const session = activeMimicSessions.get(getMimicSessionKey(message.channel.id));
+  const inlineInput = parseMimicRateLimitCommandInput(message.content);
+
+  if (!session) {
+    await message.reply({
+      content: "Mimic mode is not active in this channel.",
+      allowedMentions: { parse: [], repliedUser: false }
+    });
+    return;
+  }
+
+  if (!inlineInput) {
+    await message.reply({
+      content: `Current mimic cooldown is \`${formatDuration(
+        getMimicReplyCooldownMs(session)
+      )}\`. Set it with \`${MIMIC_RATE_LIMIT_COMMAND} 5s\`, \`${MIMIC_RATE_LIMIT_COMMAND} 2500ms\`, or \`${MIMIC_RATE_LIMIT_COMMAND} off\`.`,
+      allowedMentions: { parse: [], repliedUser: false }
+    });
+    return;
+  }
+
+  const cooldownMs = parseDurationMs(inlineInput);
+  if (
+    cooldownMs === null ||
+    cooldownMs < 0 ||
+    cooldownMs > 3_600_000
+  ) {
+    await message.reply({
+      content:
+        "Use a cooldown from `0` to `60m`, like `500ms`, `5s`, `2m`, or `off`.",
+      allowedMentions: { parse: [], repliedUser: false }
+    });
+    return;
+  }
+
+  session.replyCooldownMs = cooldownMs;
+  logEvent("mimic_rate_limit_updated", {
+    guildId: session.guildId,
+    channelId: session.channelId,
+    targetUserId: session.targetUserId,
+    updatedByUserId: message.author.id,
+    cooldownMs
+  });
+
+  await message.reply({
+    content: `Mimic cooldown is now \`${formatDuration(cooldownMs)}\` for \`${session.targetDisplayName}\` in this channel.`,
+    allowedMentions: { parse: [], repliedUser: false }
+  });
 }
 
 function normalizeMimicRepetitionText(text) {
@@ -2892,9 +3174,11 @@ async function startMimicSession(message) {
     startedByUserId: message.author.id,
     startedAt: Date.now(),
     lastReplyAt: 0,
+    replyCooldownMs: MIMIC_REPLY_COOLDOWN_MS,
     mimicReplyMessageIds: new Set(),
     recentExchanges: [],
     recentRepliesByUserId: new Map(),
+    activeMimicThread: null,
     profilePath
   };
 
@@ -3002,23 +3286,58 @@ async function handleActiveMimicSession(message) {
     session
   );
   const isDirectMimicReply = Boolean(referencedMimicBotMessage);
-  const recentUserFollowup = getRecentMimicReplyForUser(
-    session,
-    message.author.id
-  );
+  const recentUserFollowup = isDirectMimicReply
+    ? getRecentMimicReplyForUser(session, message.author.id)
+    : getEligibleImplicitMimicFollowup(session, message);
   const isRecentUserFollowup = Boolean(recentUserFollowup);
   const isDirectTrigger =
     isDirectMimicReply ||
     isRecentUserFollowup ||
     messageLooksLikeMimicTrigger(message, session);
+  if (
+    !isDirectMimicReply &&
+    !message.mentions.users.has(session.targetUserId) &&
+    messageLooksLikeMimicManagementChatter(message)
+  ) {
+    logEvent("mimic_reply_skipped_management_chatter", {
+      guildId: session.guildId,
+      channelId: session.channelId,
+      targetUserId: session.targetUserId,
+      authorId: message.author.id,
+      currentAuthorIsTarget
+    });
+    return false;
+  }
+
+  const activeThread = getActiveMimicThread(session);
+  if (
+    activeThread &&
+    activeThread.userId !== message.author.id &&
+    !isDirectTrigger &&
+    !messageCanInterruptActiveMimicThread(message, session)
+  ) {
+    logEvent("mimic_reply_skipped_thread_lock", {
+      guildId: session.guildId,
+      channelId: session.channelId,
+      targetUserId: session.targetUserId,
+      activeThreadUserId: activeThread.userId,
+      activeThreadUserName: activeThread.userName,
+      messageAuthorId: message.author.id,
+      currentAuthorIsTarget
+    });
+    return false;
+  }
+
+  const replyCooldownMs = getMimicReplyCooldownMs(session);
   const cooldownRemainingMs =
-    MIMIC_REPLY_COOLDOWN_MS - (Date.now() - session.lastReplyAt);
+    replyCooldownMs - (Date.now() - session.lastReplyAt);
   if (!isDirectTrigger && cooldownRemainingMs > 0) {
     logEvent("mimic_reply_skipped_cooldown", {
       guildId: session.guildId,
       channelId: session.channelId,
       targetUserId: session.targetUserId,
       currentAuthorIsTarget,
+      replyCooldownMs,
       cooldownRemainingMs
     });
     return false;
@@ -3182,7 +3501,7 @@ async function handleActiveMimicSession(message) {
     !isDirectMimicReply &&
     !isRecentUserFollowup &&
     (!decision.shouldReply ||
-      decision.confidence < 0.55 ||
+      decision.confidence < MIMIC_AUTO_REPLY_CONFIDENCE_MIN ||
       decision.styleFit < MIMIC_STYLE_MATCH_MIN ||
       decision.originality < MIMIC_ORIGINALITY_MIN ||
       !decision.reply)
@@ -3207,7 +3526,7 @@ async function handleActiveMimicSession(message) {
     isRecentUserFollowup &&
     !isDirectMimicReply &&
     (!decision.shouldReply ||
-      decision.confidence < 0.45 ||
+      decision.confidence < MIMIC_FOLLOWUP_REPLY_CONFIDENCE_MIN ||
       decision.styleFit < MIMIC_STYLE_MATCH_MIN ||
       decision.originality < MIMIC_ORIGINALITY_MIN ||
       !decision.reply)
@@ -4671,6 +4990,9 @@ client.once("clientReady", async () => {
     mimicCommandEnabled: ENABLE_MIMIC_COMMAND,
     mimicCommand: ENABLE_MIMIC_COMMAND ? MIMIC_COMMAND : null,
     unmimicCommand: ENABLE_MIMIC_COMMAND ? UNMIMIC_COMMAND : null,
+    mimicRateLimitCommand: ENABLE_MIMIC_COMMAND
+      ? MIMIC_RATE_LIMIT_COMMAND
+      : null,
     mimicModel: ENABLE_MIMIC_COMMAND ? MIMIC_MODEL : null,
     mimicDataDir: ENABLE_MIMIC_COMMAND ? MIMIC_DATA_DIR_ABSOLUTE : null,
     groqTextFallbackModels: GROQ_TEXT_FALLBACK_MODELS,
@@ -4714,6 +5036,9 @@ client.on("messageCreate", async (message) => {
   const isArgueCommand = isArgueCommandMessage(message.content);
   const isMimicCommand = isMimicCommandMessage(message.content);
   const isUnmimicCommand = isUnmimicCommandMessage(message.content);
+  const isMimicRateLimitCommand = isMimicRateLimitCommandMessage(
+    message.content
+  );
   const messageLog = {
     guildId: message.guild?.id ?? "dm",
     guildName: message.guild?.name ?? "dm",
@@ -4727,6 +5052,7 @@ client.on("messageCreate", async (message) => {
     isArgueCommand,
     isMimicCommand,
     isUnmimicCommand,
+    isMimicRateLimitCommand,
     hasAttachments: message.attachments.size > 0
   };
 
@@ -4749,7 +5075,8 @@ client.on("messageCreate", async (message) => {
       isGifCommand ||
       isArgueCommand ||
       isMimicCommand ||
-      isUnmimicCommand) &&
+      isUnmimicCommand ||
+      isMimicRateLimitCommand) &&
     !isUserAllowedToPromptBot(message.author.id)
   ) {
     const commandName = isArgueCommand
@@ -4758,9 +5085,11 @@ client.on("messageCreate", async (message) => {
         ? MIMIC_COMMAND
         : isUnmimicCommand
           ? UNMIMIC_COMMAND
-          : isGifCommand
-            ? GIF_COMMAND
-            : TEST_COMMAND;
+          : isMimicRateLimitCommand
+            ? MIMIC_RATE_LIMIT_COMMAND
+            : isGifCommand
+              ? GIF_COMMAND
+              : TEST_COMMAND;
     await blockUnauthorizedPrompt(message, commandName);
     return;
   }
@@ -4874,7 +5203,7 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
-  if (isMimicCommand || isUnmimicCommand) {
+  if (isMimicCommand || isUnmimicCommand || isMimicRateLimitCommand) {
     if (
       MIMIC_COMMAND_REQUIRES_ADMIN &&
       !message.member?.permissions?.has(PermissionFlagsBits.ManageGuild)
@@ -4883,7 +5212,11 @@ client.on("messageCreate", async (message) => {
         guildId: message.guild?.id ?? "dm",
         channelId: message.channel.id,
         authorId: message.author.id,
-        commandName: isMimicCommand ? MIMIC_COMMAND : UNMIMIC_COMMAND
+        commandName: isMimicCommand
+          ? MIMIC_COMMAND
+          : isUnmimicCommand
+            ? UNMIMIC_COMMAND
+            : MIMIC_RATE_LIMIT_COMMAND
       });
       return;
     }
@@ -4892,15 +5225,21 @@ client.on("messageCreate", async (message) => {
       await message.channel.sendTyping().catch(() => null);
       if (isMimicCommand) {
         await startMimicSession(message);
-      } else {
+      } else if (isUnmimicCommand) {
         await stopMimicSession(message);
+      } else {
+        await setMimicRateLimit(message);
       }
     } catch (error) {
       logError("mimic_command_failed", error, {
         guildId: message.guild?.id ?? "dm",
         channelId: message.channel.id,
         authorId: message.author.id,
-        commandName: isMimicCommand ? MIMIC_COMMAND : UNMIMIC_COMMAND
+        commandName: isMimicCommand
+          ? MIMIC_COMMAND
+          : isUnmimicCommand
+            ? UNMIMIC_COMMAND
+            : MIMIC_RATE_LIMIT_COMMAND
       });
 
       await message.reply({
