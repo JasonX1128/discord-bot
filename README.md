@@ -158,3 +158,17 @@ allam-2-7b
 ```
 
 If `ENABLE_GEMMA_LLM_FALLBACK=true` and `GEMMA_API_KEY` is set, Gemma is used as the final fallback after all Groq text models fail. Vision GIF reranking still starts with `GIF_VISION_MODEL`; if that fails, it falls back to the title/metadata reranker, which uses the text fallback stack above.
+
+## Argue command
+
+Set `ENABLE_ARGUE_COMMAND=true` and make sure `GROQ_API_KEY` is configured.
+
+- Send `!argue` after a debate. The bot reads recent human messages, identifies who you were likely arguing with, announces a short session ID, sends one message defending your claim, and opens a short-lived session.
+- Send `!argue your claim here` if you want to tell it what claim to defend while still using recent chat for context.
+- Send `!argue stop` to end your active argument session in that channel.
+- Send `!argue stop abc123` to end the active argument session with that ID in the current channel.
+
+While active, the bot classifies each new channel message. It responds only when the message appears relevant to the same argument and challenges your side. Random interjections and unrelated side chatter are logged as ignored and do not get replies. The session ends after inactivity, after `ARGUE_MAX_BOT_REPLIES`, or after `ARGUE_MAX_SESSION_MS`.
+
+The bot never replies to the user who started `!argue`; it only tracks their messages as context. If another user clearly joins the argument, the bot adds them to the opponent list and announces the updated names in-channel. During an active session, direct insults aimed at `jason`, `json`, or `jsn` are treated as argumentative and force a response.
+
