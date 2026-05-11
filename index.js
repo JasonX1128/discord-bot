@@ -4290,3 +4290,503 @@ async function fetchGiphyGifWithRetries({
   );
 }
 
+async function selectReplyForMessage({
+  message,
+  gemmaInputText = null,
+  eventContext = {}
+}) {
+  let selectedReply = pickRandomFallbackReply();
+
+  if (USE_GEMMA) {
+    try {
+      selectedReply = await generateGemmaReply(message, gemmaInputText);
+      logEvent("gemma_reply_generated", {
+        ...eventContext,
+        model: GEMMA_MODEL
+      });
+    } catch (error) {
+      logError("gemma_reply_failed_fallback_used", error, eventContext);
+    }
+  }
+
+  return selectedReply;
+}
+
+async function reactToTargetMessage(message) {
+  if (!TARGET_REACTION_EMOJI) return;
+
+  try {
+    await message.react(TARGET_REACTION_EMOJI);
+    logEvent("target_message_reacted", {
+      guildId: message.guild?.id ?? "dm",
+      channelId: message.channel.id,
+      targetUserId: TARGET_USER_ID,
+      emoji: TARGET_REACTION_EMOJI
+    });
+  } catch (error) {
+    logError("target_message_reaction_failed", error, {
+      guildId: message.guild?.id ?? "dm",
+      channelId: message.channel.id,
+      targetUserId: TARGET_USER_ID,
+      emoji: TARGET_REACTION_EMOJI
+    });
+  }
+}
+
+async function syncTargetNicknameInGuild(guild) {
+  const member = await guild.members.fetch(TARGET_USER_ID).catch(() => null);
+  if (!member) {
+    logEvent("nickname_target_not_in_guild", {
+      guildId: guild.id,
+      guildName: guild.name
+    });
+    return;
+  }
+
+  if (!member.manageable) {
+    if (!warnedGuildIds.has(guild.id)) {
+      logEvent("nickname_not_manageable", {
+        guildId: guild.id,
+        guildName: guild.name,
+        targetUserId: TARGET_USER_ID
+      });
+      warnedGuildIds.add(guild.id);
+    }
+    return;
+  }
+
+  warnedGuildIds.delete(guild.id);
+
+  if (member.nickname === TARGET_NICKNAME) {
+    logEvent("nickname_already_set", {
+      guildId: guild.id,
+      guildName: guild.name,
+      targetUserId: TARGET_USER_ID,
+      nickname: TARGET_NICKNAME
+    });
+    return;
+  }
+
+  try {
+    await member.setNickname(TARGET_NICKNAME);
+    logEvent("nickname_changed", {
+      guildId: guild.id,
+      guildName: guild.name,
+      targetUserId: TARGET_USER_ID,
+      nickname: TARGET_NICKNAME
+    });
+  } catch (error) {
+    logError("nickname_change_failed", error, {
+      guildId: guild.id,
+      guildName: guild.name,
+      targetUserId: TARGET_USER_ID
+    });
+  }
+}
+
+async function syncTargetNicknameAcrossGuilds() {
+  if (nicknameSyncInProgress) return;
+  nicknameSyncInProgress = true;
+  logEvent("nickname_sync_started", { guildCount: client.guilds.cache.size });
+
+  try {
+    for (const guild of client.guilds.cache.values()) {
+      await syncTargetNicknameInGuild(guild);
+    }
+  } finally {
+    nicknameSyncInProgress = false;
+    logEvent("nickname_sync_finished");
+  }
+}
+
+client.once("clientReady", async () => {
+  logEvent("bot_ready", {
+    botTag: client.user.tag,
+    guildCount: client.guilds.cache.size,
+    nicknameSyncEnabled: ENABLE_NICKNAME_SYNC,
+    targetReplyChance: TARGET_REPLY_CHANCE,
+    targetReactionEmoji: TARGET_REACTION_EMOJI || null,
+    useGemma: USE_GEMMA,
+    gemmaModel: USE_GEMMA ? GEMMA_MODEL : null,
+    testCommandEnabled: ENABLE_TEST_COMMAND,
+    testCommand: ENABLE_TEST_COMMAND ? TEST_COMMAND : null,
+    gifCommandEnabled: ENABLE_GIF_COMMAND,
+    gifCommand: ENABLE_GIF_COMMAND ? GIF_COMMAND : null,
+    argueCommandEnabled: ENABLE_ARGUE_COMMAND,
+    argueCommand: ENABLE_ARGUE_COMMAND ? ARGUE_COMMAND : null,
+    argueModel: ENABLE_ARGUE_COMMAND ? ARGUE_MODEL : null,
+    mimicCommandEnabled: ENABLE_MIMIC_COMMAND,
+    mimicCommand: ENABLE_MIMIC_COMMAND ? MIMIC_COMMAND : null,
+    unmimicCommand: ENABLE_MIMIC_COMMAND ? UNMIMIC_COMMAND : null,
+    mimicModel: ENABLE_MIMIC_COMMAND ? MIMIC_MODEL : null,
+    mimicDataDir: ENABLE_MIMIC_COMMAND ? MIMIC_DATA_DIR_ABSOLUTE : null,
+    groqTextFallbackModels: GROQ_TEXT_FALLBACK_MODELS,
+    gemmaLlmFallbackEnabled:
+      ENABLE_GEMMA_LLM_FALLBACK && hasConfiguredGemmaApiKey(),
+    promptWhitelistEnabled: DISCORD_USER_WHITELIST_IDS.size > 0,
+    gifCandidateRerankEnabled: GIF_ENABLE_CANDIDATE_RERANK,
+    gifVisionRerankEnabled: GIF_ENABLE_VISION_RERANK,
+    gifVisionModel: GIF_ENABLE_VISION_RERANK ? GIF_VISION_MODEL : null
+  });
+
+  if (ENABLE_ARGUE_COMMAND) {
+    setInterval(() => {
+      cleanupExpiredArgueSessions();
+    }, 60_000);
+  }
+
+  if (ENABLE_NICKNAME_SYNC) {
+    await syncTargetNicknameAcrossGuilds();
+
+    setInterval(() => {
+      syncTargetNicknameAcrossGuilds().catch((error) => {
+        logError("nickname_sync_loop_failed", error);
+      });
+    }, NICKNAME_SYNC_INTERVAL_MS);
+  } else {
+    logEvent("nickname_sync_disabled");
+  }
+});
+
+client.on("guildCreate", async (guild) => {
+  logEvent("joined_guild", { guildId: guild.id, guildName: guild.name });
+  if (ENABLE_NICKNAME_SYNC) {
+    await syncTargetNicknameInGuild(guild);
+  }
+});
+
+client.on("messageCreate", async (message) => {
+  const isTestCommand = isTestCommandMessage(message.content);
+  const isGifCommand = isGifCommandMessage(message.content);
+  const isArgueCommand = isArgueCommandMessage(message.content);
+  const isMimicCommand = isMimicCommandMessage(message.content);
+  const isUnmimicCommand = isUnmimicCommandMessage(message.content);
+  const messageLog = {
+    guildId: message.guild?.id ?? "dm",
+    guildName: message.guild?.name ?? "dm",
+    channelId: message.channel.id,
+    authorId: message.author.id,
+    authorTag: message.author.tag,
+    isBotAuthor: message.author.bot,
+    isTargetUser: message.author.id === TARGET_USER_ID,
+    isTestCommand,
+    isGifCommand,
+    isArgueCommand,
+    isMimicCommand,
+    isUnmimicCommand,
+    hasAttachments: message.attachments.size > 0
+  };
+
+  if (LOG_MESSAGE_CONTENT) {
+    messageLog.content = message.content.slice(0, 200);
+  }
+
+  if (LOG_ALL_MESSAGES) {
+    logEvent("message_received", messageLog);
+  }
+
+  if (message.author.bot) return;
+
+  if (message.author.id === TARGET_USER_ID) {
+    await reactToTargetMessage(message);
+  }
+
+  if (
+    (isTestCommand ||
+      isGifCommand ||
+      isArgueCommand ||
+      isMimicCommand ||
+      isUnmimicCommand) &&
+    !isUserAllowedToPromptBot(message.author.id)
+  ) {
+    const commandName = isArgueCommand
+      ? ARGUE_COMMAND
+      : isMimicCommand
+        ? MIMIC_COMMAND
+        : isUnmimicCommand
+          ? UNMIMIC_COMMAND
+          : isGifCommand
+            ? GIF_COMMAND
+            : TEST_COMMAND;
+    await blockUnauthorizedPrompt(message, commandName);
+    return;
+  }
+
+  if (isTestCommand) {
+    if (
+      TEST_COMMAND_REQUIRES_ADMIN &&
+      !message.member?.permissions?.has(PermissionFlagsBits.ManageGuild)
+    ) {
+      logEvent("test_command_blocked_non_admin", {
+        guildId: message.guild?.id ?? "dm",
+        channelId: message.channel.id,
+        authorId: message.author.id
+      });
+      return;
+    }
+
+    let gemmaInputText = parseTestCommandInlineInput(message.content);
+    let referencedMessage = null;
+
+    if (!gemmaInputText && message.reference?.messageId) {
+      referencedMessage = await message.fetchReference().catch(() => null);
+      gemmaInputText = referencedMessage?.content?.trim() || null;
+    }
+
+    if (!gemmaInputText) {
+      gemmaInputText = "Test trigger message.";
+    }
+
+    const selectedReply = await selectReplyForMessage({
+      message,
+      gemmaInputText,
+      eventContext: {
+        guildId: message.guild?.id ?? "dm",
+        channelId: message.channel.id,
+        triggerType: "test_command"
+      }
+    });
+
+    logEvent("test_command_triggered", {
+      ...messageLog,
+      usingReferencedMessage: Boolean(referencedMessage),
+      selectedReply
+    });
+
+    try {
+      if (referencedMessage) {
+        await referencedMessage.reply({
+          content: selectedReply,
+          allowedMentions: { parse: [], repliedUser: false }
+        });
+      } else {
+        await message.reply({
+          content: selectedReply,
+          allowedMentions: { parse: [], repliedUser: false }
+        });
+      }
+
+      logEvent("test_reply_sent", {
+        guildId: message.guild?.id ?? "dm",
+        channelId: message.channel.id,
+        authorId: message.author.id
+      });
+    } catch (error) {
+      logError("test_reply_send_failed", error, {
+        guildId: message.guild?.id ?? "dm",
+        channelId: message.channel.id,
+        authorId: message.author.id
+      });
+    }
+
+    return;
+  }
+
+  if (isArgueCommand) {
+    if (
+      ARGUE_COMMAND_REQUIRES_ADMIN &&
+      !message.member?.permissions?.has(PermissionFlagsBits.ManageGuild)
+    ) {
+      logEvent("argue_command_blocked_non_admin", {
+        guildId: message.guild?.id ?? "dm",
+        channelId: message.channel.id,
+        authorId: message.author.id
+      });
+      return;
+    }
+
+    const commandInput = parseArgueCommandInput(message.content);
+
+    try {
+      if (commandInput.action === "stop") {
+        await stopArgueSessionForMessage(message, commandInput.sessionId);
+      } else {
+        await message.channel.sendTyping().catch(() => null);
+        await startArgueSession(message, commandInput.prompt);
+      }
+    } catch (error) {
+      logError("argue_command_failed", error, {
+        guildId: message.guild?.id ?? "dm",
+        channelId: message.channel.id,
+        authorId: message.author.id,
+        action: commandInput.action
+      });
+
+      await message.reply({
+        content: "I couldn't start argument mode right now.",
+        allowedMentions: { parse: [], repliedUser: false }
+      });
+    }
+
+    return;
+  }
+
+  if (isMimicCommand || isUnmimicCommand) {
+    if (
+      MIMIC_COMMAND_REQUIRES_ADMIN &&
+      !message.member?.permissions?.has(PermissionFlagsBits.ManageGuild)
+    ) {
+      logEvent("mimic_command_blocked_non_admin", {
+        guildId: message.guild?.id ?? "dm",
+        channelId: message.channel.id,
+        authorId: message.author.id,
+        commandName: isMimicCommand ? MIMIC_COMMAND : UNMIMIC_COMMAND
+      });
+      return;
+    }
+
+    try {
+      await message.channel.sendTyping().catch(() => null);
+      if (isMimicCommand) {
+        await startMimicSession(message);
+      } else {
+        await stopMimicSession(message);
+      }
+    } catch (error) {
+      logError("mimic_command_failed", error, {
+        guildId: message.guild?.id ?? "dm",
+        channelId: message.channel.id,
+        authorId: message.author.id,
+        commandName: isMimicCommand ? MIMIC_COMMAND : UNMIMIC_COMMAND
+      });
+
+      await message.reply({
+        content: "I couldn't update mimic mode right now.",
+        allowedMentions: { parse: [], repliedUser: false }
+      });
+    }
+
+    return;
+  }
+
+  if (isGifCommand) {
+    if (
+      GIF_COMMAND_REQUIRES_ADMIN &&
+      !message.member?.permissions?.has(PermissionFlagsBits.ManageGuild)
+    ) {
+      logEvent("gif_command_blocked_non_admin", {
+        guildId: message.guild?.id ?? "dm",
+        channelId: message.channel.id,
+        authorId: message.author.id
+      });
+      return;
+    }
+
+    const prompt = parseGifCommandPrompt(message.content);
+
+    try {
+      await message.channel.sendTyping().catch(() => null);
+
+      const selectedGifQuery = await selectGifSearchQuery({
+        commandMessage: message,
+        userPrompt: prompt
+      });
+      const gif = await fetchGiphyGifWithRetries({
+        commandMessage: message,
+        userPrompt: prompt,
+        firstQuery: selectedGifQuery.query,
+        firstQuerySource: selectedGifQuery.source,
+        userId: message.author.id
+      });
+
+      await message.channel.send({
+        content: gif.url,
+        allowedMentions: { parse: [] }
+      });
+
+      fireGiphySentAnalytics(gif.analyticsGif, gif.randomId).catch((error) => {
+        logError("giphy_sent_analytics_failed", error, {
+          gifId: gif.id,
+          authorId: message.author.id
+        });
+      });
+
+      logEvent("gif_sent", {
+        guildId: message.guild?.id ?? "dm",
+        channelId: message.channel.id,
+        authorId: message.author.id,
+        userPrompt: prompt,
+        query: gif.prompt,
+        querySource: gif.querySource,
+        selectionSource: gif.selectionSource,
+        selectionIndex: gif.selectionIndex,
+        candidateCount: gif.candidateCount,
+        attemptNumber: gif.attemptNumber,
+        failedAttemptCount: gif.failedAttempts.length,
+        gifId: gif.id,
+        title: gif.title
+      });
+    } catch (error) {
+      logError("gif_command_failed", error, {
+        guildId: message.guild?.id ?? "dm",
+        channelId: message.channel.id,
+        authorId: message.author.id,
+        prompt
+      });
+
+      await message.reply({
+        content: prompt
+          ? `I couldn't find a GIF for "${prompt}".`
+          : "I couldn't find a GIF right now.",
+        allowedMentions: { parse: [], repliedUser: false }
+      });
+    }
+
+    return;
+  }
+
+  if (await handleActiveArgueSessions(message)) {
+    return;
+  }
+
+  if (await handleActiveMimicSession(message)) {
+    return;
+  }
+
+  if (message.author.id !== TARGET_USER_ID) return;
+
+  const targetReplyRoll = Math.random();
+  if (targetReplyRoll >= TARGET_REPLY_CHANCE) {
+    logEvent("target_message_skipped_by_chance", {
+      ...messageLog,
+      targetReplyChance: TARGET_REPLY_CHANCE,
+      roll: Number(targetReplyRoll.toFixed(6))
+    });
+    return;
+  }
+
+  const selectedReply = await selectReplyForMessage({
+    message,
+    eventContext: {
+      guildId: message.guild?.id ?? "dm",
+      channelId: message.channel.id,
+      targetUserId: TARGET_USER_ID,
+      triggerType: "target_user_message"
+    }
+  });
+
+  logEvent("target_message_detected", {
+    ...messageLog,
+    selectedReply
+  });
+
+  try {
+    await message.channel.send({
+      content: selectedReply,
+      allowedMentions: { parse: [] }
+    });
+    logEvent("reply_sent", {
+      guildId: message.guild?.id ?? "dm",
+      channelId: message.channel.id,
+      targetUserId: TARGET_USER_ID
+    });
+  } catch (error) {
+    logError("reply_send_failed", error, {
+      guildId: message.guild?.id ?? "dm",
+      channelId: message.channel.id,
+      targetUserId: TARGET_USER_ID
+    });
+  }
+});
+
+client.login(TOKEN);
