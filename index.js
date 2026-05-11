@@ -1916,6 +1916,8 @@ function createDefaultMimicProfile({ guildId, userId, username, displayName }) {
     profileExampleCountAtLastUpdate: 0,
     profileSummary: "",
     styleNotes: [],
+    orthographyNotes: [],
+    punctuationNotes: [],
     interests: [],
     recurringPhrases: [],
     doNotOverdo: [],
@@ -1958,6 +1960,12 @@ async function loadMimicProfile({ guildId, user, displayName }) {
   profile.examples = Array.isArray(profile.examples) ? profile.examples : [];
   profile.styleNotes = Array.isArray(profile.styleNotes)
     ? profile.styleNotes
+    : [];
+  profile.orthographyNotes = Array.isArray(profile.orthographyNotes)
+    ? profile.orthographyNotes
+    : [];
+  profile.punctuationNotes = Array.isArray(profile.punctuationNotes)
+    ? profile.punctuationNotes
     : [];
   profile.interests = Array.isArray(profile.interests) ? profile.interests : [];
   profile.recurringPhrases = Array.isArray(profile.recurringPhrases)
@@ -2117,6 +2125,117 @@ function normalizeStringArray(value, maxItems = 12) {
     .slice(0, maxItems);
 }
 
+function getMimicProfileStyleMetrics(profileOrExamples) {
+  const examples = Array.isArray(profileOrExamples)
+    ? profileOrExamples
+    : profileOrExamples?.examples;
+  const texts = (Array.isArray(examples) ? examples : [])
+    .map((example) => String(example?.content ?? "").trim())
+    .filter(Boolean)
+    .filter((text) => !/^\[\d+ attachment\(s\)\]$/i.test(text));
+
+  const metrics = {
+    messageCount: texts.length,
+    avgChars: 0,
+    apostropheMessages: 0,
+    gDroppedMessages: 0,
+    terminalPeriodMessages: 0,
+    terminalPunctuationMessages: 0,
+    formalPunctuationMarks: 0,
+    lowercaseStartMessages: 0,
+    allCapsMessages: 0,
+    exampleApostrophes: [],
+    exampleGDrops: []
+  };
+
+  if (texts.length === 0) return metrics;
+
+  let charTotal = 0;
+  for (const text of texts) {
+    const withoutUrls = text.replace(/https?:\/\/\S+/gi, "").trim();
+    charTotal += withoutUrls.length;
+
+    const apostrophes = [
+      ...withoutUrls.matchAll(/\b[\p{L}\p{N}]+['’][\p{L}\p{N}]+\b/gu)
+    ].map((match) => match[0]);
+    if (apostrophes.length > 0) {
+      metrics.apostropheMessages += 1;
+      metrics.exampleApostrophes.push(...apostrophes.slice(0, 3));
+    }
+
+    const gDrops = [
+      ...withoutUrls.matchAll(
+        /\b(?:[a-z]{3,}in['’]|goin|doin|sayin|thinkin|talkin|lookin|workin|playin|tryin|somethin|nothin|anythin|everythin)\b/giu
+      )
+    ].map((match) => match[0]);
+    if (gDrops.length > 0) {
+      metrics.gDroppedMessages += 1;
+      metrics.exampleGDrops.push(...gDrops.slice(0, 3));
+    }
+
+    if (/[.]$/.test(withoutUrls)) metrics.terminalPeriodMessages += 1;
+    if (/[.!?。！？]$/.test(withoutUrls)) {
+      metrics.terminalPunctuationMessages += 1;
+    }
+
+    metrics.formalPunctuationMarks += (
+      withoutUrls.match(/[.,;:]/g) ?? []
+    ).length;
+
+    const firstLetter = withoutUrls.match(/\p{L}/u)?.[0] ?? "";
+    if (firstLetter && firstLetter === firstLetter.toLowerCase()) {
+      metrics.lowercaseStartMessages += 1;
+    }
+
+    const letters = withoutUrls.match(/\p{L}/gu) ?? [];
+    if (
+      letters.length >= 3 &&
+      letters.every((letter) => letter === letter.toUpperCase())
+    ) {
+      metrics.allCapsMessages += 1;
+    }
+  }
+
+  metrics.avgChars = Math.round(charTotal / texts.length);
+  metrics.apostropheRatio = metrics.apostropheMessages / texts.length;
+  metrics.gDropRatio = metrics.gDroppedMessages / texts.length;
+  metrics.terminalPeriodRatio = metrics.terminalPeriodMessages / texts.length;
+  metrics.terminalPunctuationRatio =
+    metrics.terminalPunctuationMessages / texts.length;
+  metrics.formalPunctuationPerMessage =
+    metrics.formalPunctuationMarks / texts.length;
+  metrics.lowercaseStartRatio = metrics.lowercaseStartMessages / texts.length;
+  metrics.allCapsRatio = metrics.allCapsMessages / texts.length;
+  metrics.exampleApostrophes = [...new Set(metrics.exampleApostrophes)].slice(
+    0,
+    8
+  );
+  metrics.exampleGDrops = [...new Set(metrics.exampleGDrops)].slice(0, 8);
+
+  return metrics;
+}
+
+function formatRatio(value) {
+  return `${Math.round(Number(value ?? 0) * 100)}%`;
+}
+
+function formatMimicStyleMetrics(metrics) {
+  if (!metrics.messageCount) return "No measured writing-style examples yet.";
+
+  return [
+    `messages=${metrics.messageCount}`,
+    `avgChars=${metrics.avgChars}`,
+    `lowercaseStart=${formatRatio(metrics.lowercaseStartRatio)}`,
+    `apostropheContractions=${metrics.apostropheMessages}/${metrics.messageCount} (${formatRatio(metrics.apostropheRatio)})`,
+    `gDropping=${metrics.gDroppedMessages}/${metrics.messageCount} (${formatRatio(metrics.gDropRatio)})`,
+    `terminalPeriods=${metrics.terminalPeriodMessages}/${metrics.messageCount} (${formatRatio(metrics.terminalPeriodRatio)})`,
+    `anyTerminalPunctuation=${metrics.terminalPunctuationMessages}/${metrics.messageCount} (${formatRatio(metrics.terminalPunctuationRatio)})`,
+    `formalPunctuationMarksPerMessage=${metrics.formalPunctuationPerMessage.toFixed(2)}`,
+    `apostropheExamples=${metrics.exampleApostrophes.join(", ") || "(none)"}`,
+    `gDropExamples=${metrics.exampleGDrops.join(", ") || "(none)"}`
+  ].join("; ");
+}
+
 function buildMimicProfileUpdatePrompt(profile) {
   const newExampleCount = Math.max(0, Number(profile.examplesSinceProfileUpdate ?? 0));
   const newestExamples = profile.examples
@@ -2130,11 +2249,16 @@ function buildMimicProfileUpdatePrompt(profile) {
   const examplesAtLastUpdate = Number(
     profile.profileExampleCountAtLastUpdate ?? 0
   );
+  const styleMetrics = getMimicProfileStyleMetrics(profile);
 
   return [
     "Build or update a persistent Discord style profile from these messages.",
     "Focus on tone, pacing, humor, interests, recurring phrases, conversational habits, and things to avoid overdoing.",
     "Be specific about mechanics: typical length, lowercase/all-caps habits, typo/slang density, punctuation, directness, when they joke, and when they sound sincere.",
+    "Pay special attention to orthography: apostrophes, contractions, missing apostrophes, dropped g endings, spelling shortcuts, capitalization, and emoji habits.",
+    "Pay special attention to punctuation: whether they use periods, commas, semicolons, question marks, or mostly bare sentence fragments.",
+    "Do not invent dialect spelling like goin, doin, somethin, or somethin' unless the examples clearly show it.",
+    "Do not add polished punctuation, commas, semicolons, or sentence-ending periods if examples usually avoid them.",
     "Do not write generic traits like 'sarcastic and humorous' unless examples strongly support them; explain the exact flavor.",
     "Treat the previous profile as a provisional hypothesis, not as ground truth.",
     "If the previous profile was built from only a few examples, revise it aggressively when newer examples contradict it.",
@@ -2143,14 +2267,17 @@ function buildMimicProfileUpdatePrompt(profile) {
     "Recurring phrases are evidence, not commands. Mark phrases that would sound fake if overused in doNotOverdo.",
     "Do not infer sensitive traits. Do not include private or identifying secrets.",
     "Return exactly this JSON shape and nothing else:",
-    "{\"profileSummary\":\"short paragraph\",\"styleNotes\":[\"note\"],\"interests\":[\"topic\"],\"recurringPhrases\":[\"phrase\"],\"doNotOverdo\":[\"warning\"]}",
+    "{\"profileSummary\":\"short paragraph\",\"styleNotes\":[\"note\"],\"orthographyNotes\":[\"note\"],\"punctuationNotes\":[\"note\"],\"interests\":[\"topic\"],\"recurringPhrases\":[\"phrase\"],\"doNotOverdo\":[\"warning\"]}",
     "",
     `User: ${profile.displayName} (@${profile.username})`,
     `Total stored examples: ${profile.examples.length}`,
     `Examples added since last profile update: ${newExampleCount}`,
     `Examples available at last profile update: ${examplesAtLastUpdate}`,
+    `Measured writing style: ${formatMimicStyleMetrics(styleMetrics)}`,
     `Previous profile summary: ${profile.profileSummary || "(none)"}`,
     `Previous style notes: ${profile.styleNotes.join("; ") || "(none)"}`,
+    `Previous orthography notes: ${profile.orthographyNotes.join("; ") || "(none)"}`,
+    `Previous punctuation notes: ${profile.punctuationNotes.join("; ") || "(none)"}`,
     `Previous interests: ${profile.interests.join("; ") || "(none)"}`,
     "",
     "Newest examples since the last update. Use these to correct drift:",
@@ -2220,6 +2347,14 @@ async function refreshMimicProfile(
     profile.profileSummary =
       asStringOrNull(parsed.profileSummary) || profile.profileSummary || "";
     profile.styleNotes = normalizeStringArray(parsed.styleNotes, 14);
+    profile.orthographyNotes = normalizeStringArray(
+      parsed.orthographyNotes,
+      12
+    );
+    profile.punctuationNotes = normalizeStringArray(
+      parsed.punctuationNotes,
+      12
+    );
     profile.interests = normalizeStringArray(parsed.interests, 14);
     profile.recurringPhrases = normalizeStringArray(
       parsed.recurringPhrases,
@@ -2480,6 +2615,7 @@ function buildMimicDecisionPrompt({
   const prefix = getMimicDisclosurePrefix(session.targetDisplayName);
   const referencedMimicBotMessage = context.referencedMimicBotMessage;
   const recentUserFollowup = context.recentUserFollowup;
+  const styleMetrics = getMimicProfileStyleMetrics(profile);
 
   return [
     "You are a disclosed Discord style-simulation engine.",
@@ -2490,6 +2626,9 @@ function buildMimicDecisionPrompt({
     "Have some agency: if replying, make a fresh conversational move. React, answer, tease, disagree, ask a short follow-up, or add a relevant opinion the target user might plausibly add.",
     "Do not merely retrieve an old example, summarize the chat, or parrot a catchphrase. Style examples are evidence, not templates.",
     "Tone fit matters more than topic fit: match their usual brevity, lowercase/all-caps habits, typo/slang density, punctuation, directness, and emotional intensity.",
+    "Orthography fit is mandatory: do not invent dropped-g spellings like goin/doin/somethin/somethin' unless measured examples show the target uses them.",
+    "Apostrophe fit is mandatory: if examples mostly omit apostrophes in casual contractions, do not polish them into don't/it's/I'm style. Match the target's actual habit.",
+    "Punctuation fit is mandatory: if examples mostly avoid terminal periods, commas, semicolons, or formal punctuation, write short bare fragments instead of polished sentences.",
     "Use at most one recurring phrase or slang marker, and only if it fits naturally. Never force 'bro', 'holy slop', or any other phrase just because it appears in examples.",
     "Avoid generic assistant diction, complete explanatory sentences, and polished corporate tone.",
     "Do not reproduce hateful or protected-class insults from examples; keep the target's vibe without copying that content.",
@@ -2521,8 +2660,11 @@ function buildMimicDecisionPrompt({
     `Target user to stylistically simulate: ${profile.displayName} (@${profile.username}) [id=${profile.userId}]`,
     `Newest message uses non-English script: ${context.currentMessageUsesNonEnglishScript ? "yes" : "no"}`,
     `Recent transcript uses non-English script: ${context.transcriptUsesNonEnglishScript ? "yes" : "no"}`,
+    `Measured writing style: ${formatMimicStyleMetrics(styleMetrics)}`,
     `Persistent profile: ${profile.profileSummary || "(not enough data yet)"}`,
     `Style notes: ${profile.styleNotes.join("; ") || "(none)"}`,
+    `Orthography notes: ${profile.orthographyNotes.join("; ") || "(none)"}`,
+    `Punctuation notes: ${profile.punctuationNotes.join("; ") || "(none)"}`,
     `Interests: ${profile.interests.join("; ") || "(none)"}`,
     `Recurring phrases: ${profile.recurringPhrases.join("; ") || "(none)"}`,
     `Do not overdo: ${profile.doNotOverdo.join("; ") || "(none)"}`,
@@ -2617,6 +2759,42 @@ function isMimicReplyRepetitive(session, replyText) {
       const overlap = unionSize > 0 ? shared / unionSize : 0;
       return candidate.length <= 80 && previous.length <= 80 && overlap >= 0.8;
     });
+}
+
+function getMimicReplyStyleIssue(profile, replyText) {
+  const reply = String(replyText ?? "").trim();
+  if (!reply) return null;
+
+  const metrics = getMimicProfileStyleMetrics(profile);
+  if (metrics.messageCount < 8) return null;
+
+  const hasGDroppedSpelling =
+    /\b(?:[a-z]{3,}in['’]|goin|doin|sayin|thinkin|talkin|lookin|workin|playin|tryin|somethin|nothin|anythin|everythin)\b/iu.test(
+      reply
+    );
+  if (hasGDroppedSpelling && metrics.gDropRatio < 0.05) {
+    return "The reply uses dropped-g/dialect spellings, but this target's examples almost never do. Rewrite with the target's actual spelling habits; do not use goin, doin, somethin, or -in' endings.";
+  }
+
+  const apostropheContractions = [
+    ...reply.matchAll(/\b[\p{L}\p{N}]+['’][\p{L}\p{N}]+\b/gu)
+  ].map((match) => match[0]);
+  if (apostropheContractions.length > 0 && metrics.apostropheRatio < 0.08) {
+    return `The reply uses apostrophe contractions (${apostropheContractions
+      .slice(0, 5)
+      .join(", ")}), but this target rarely writes apostrophes. Rewrite without polishing casual contractions unless an exact example supports it.`;
+  }
+
+  const hasFormalPunctuation = /[.;:]/.test(reply) || /,(?=\s)/.test(reply);
+  if (hasFormalPunctuation && metrics.formalPunctuationPerMessage < 0.25) {
+    return "The reply uses formal punctuation, but this target's examples mostly avoid commas, semicolons, colons, and polished sentence structure. Rewrite as a casual fragment with minimal punctuation.";
+  }
+
+  if (/[.]$/.test(reply) && metrics.terminalPeriodRatio < 0.1) {
+    return "The reply ends with a period, but this target almost never ends chat messages with periods. Remove sentence-ending formality.";
+  }
+
+  return null;
 }
 
 function selectMimicDecisionModel(context) {
@@ -2905,6 +3083,81 @@ async function handleActiveMimicSession(message) {
         model: MIMIC_MODEL
       });
     }
+  }
+
+  if (decision.reply && isMimicReplyRepetitive(session, decision.reply)) {
+    logEvent("mimic_reply_skipped_repetitive", {
+      guildId: session.guildId,
+      channelId: session.channelId,
+      targetUserId: session.targetUserId,
+      currentAuthorIsTarget,
+      reply: decision.reply,
+      confidence: decision.confidence,
+      styleFit: decision.styleFit,
+      originality: decision.originality,
+      reason: decision.reason,
+      model: decision.model,
+      provider: decision.provider,
+      contextMessageCount: context.messageCount
+    });
+    return false;
+  }
+
+  const styleIssue = decision.reply
+    ? getMimicReplyStyleIssue(profile, decision.reply)
+    : null;
+  if (styleIssue) {
+    const rejectedReply = decision.reply;
+    try {
+      decision = await generateMimicDecision({
+        session,
+        profile,
+        context,
+        extraInstruction: `${styleIssue} Re-answer the current message with the same topic intent but stricter orthography and punctuation fit.`
+      });
+
+      logEvent("mimic_style_reply_retried", {
+        guildId: session.guildId,
+        channelId: session.channelId,
+        targetUserId: session.targetUserId,
+        rejectedReply,
+        styleIssue,
+        replacementReply: decision.reply,
+        model: decision.model,
+        provider: decision.provider
+      });
+    } catch (error) {
+      logError("mimic_style_reply_retry_failed", error, {
+        guildId: session.guildId,
+        channelId: session.channelId,
+        targetUserId: session.targetUserId,
+        rejectedReply,
+        styleIssue,
+        model: MIMIC_MODEL
+      });
+    }
+  }
+
+  const remainingStyleIssue = decision.reply
+    ? getMimicReplyStyleIssue(profile, decision.reply)
+    : null;
+  if (remainingStyleIssue) {
+    logEvent("mimic_reply_skipped_style_mismatch", {
+      guildId: session.guildId,
+      channelId: session.channelId,
+      targetUserId: session.targetUserId,
+      currentAuthorIsTarget,
+      reply: decision.reply,
+      styleIssue: remainingStyleIssue,
+      confidence: decision.confidence,
+      styleFit: decision.styleFit,
+      originality: decision.originality,
+      reason: decision.reason,
+      model: decision.model,
+      provider: decision.provider,
+      contextMessageCount: context.messageCount
+    });
+    return false;
   }
 
   if (decision.reply && isMimicReplyRepetitive(session, decision.reply)) {

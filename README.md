@@ -184,6 +184,8 @@ When mimic mode starts, the bot scans recent channel messages from the target us
 
 The profile updater is intentionally aggressive while a profile is young. If the first summary was built from only a few messages, each new real message can trigger a rewrite; after the profile has a broader sample, updates slow down to the normal `MIMIC_PROFILE_UPDATE_EXAMPLE_COUNT` cadence. The profile prompt treats old summaries as provisional so a few uncharacteristic starter messages do not permanently define the user.
 
+Mimic profiles also track orthography and punctuation notes separately from topic/style notes. The bot measures examples for apostrophe usage, dropped-g spellings, terminal periods, and formal punctuation, then retries or skips replies that invent habits the user does not show.
+
 Mimic replies are always visibly labeled with `MIMIC_DISCLOSURE_PREFIX`; the bot does not silently impersonate the real user. It only replies when the model decides there is an active conversational opening, and it ignores bot messages so it does not ramble to itself. Messages from the mimicked user are learned from and then evaluated like anyone else's, so the bot can interact with the person it is mimicking too.
 
 The mimic prompt treats stored examples as style evidence, not templates. It asks the model to make a fresh conversational move, then self-rate tone fit and originality before sending. If the style or originality scores are too low, the bot stays quiet instead of parroting a past line.
@@ -240,6 +242,8 @@ If someone replies directly to one of the bot's mimic messages, that bypasses `M
   - `mimic_followup_skipped_by_model`: a same-user follow-up bypassed cooldown, but the model judged it should not answer
   - `mimic_repetitive_reply_retried`: a proposed mimic reply matched a recent bot reply, so the bot asked once for a different answer
   - `mimic_reply_skipped_repetitive`: the retry was still too repetitive, so the bot stayed quiet
+  - `mimic_style_reply_retried`: a proposed mimic reply had off-style orthography or punctuation, so the bot asked once for a rewrite
+  - `mimic_reply_skipped_style_mismatch`: the rewrite still violated measured writing habits, so the bot stayed quiet
   - `mimic_direct_reply_missing_model_text`: a direct reply bypassed cooldown, but the model returned no usable text
   - `mimic_session_stopped`: mimic mode stopped in a channel
   - `prompt_command_blocked_user_not_whitelisted`: a user tried a command but was not in `DISCORD_USER_WHITELIST_IDS`
