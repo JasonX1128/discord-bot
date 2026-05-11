@@ -194,3 +194,61 @@ For multilingual chat, mimic mode routes messages written in non-English scripts
 
 If someone replies directly to one of the bot's mimic messages, that bypasses `MIMIC_REPLY_COOLDOWN_MS`; the bot treats the reply as a direct prompt and answers as the mimicked user with the disclosure prefix. If the same user sends another message within `MIMIC_FOLLOWUP_WINDOW_MS`, the bot treats it as a possible continuation of that exchange and can answer without waiting for the normal cooldown.
 
+## Nickname behavior
+
+- Nickname sync can be toggled with `ENABLE_NICKNAME_SYNC`.
+- The bot checks and applies `TARGET_NICKNAME` on startup.
+- It keeps checking periodically (every 60 seconds), so nickname changes are corrected even if the target user does not send a message.
+
+## Logs
+
+- Logs are JSON lines with timestamps so you can confirm events are being received.
+- Look for:
+  - `message_received`: bot received a message event
+  - `target_message_reacted`: bot reacted to a target-user message
+  - `target_message_reaction_failed`: bot could not add the target-user reaction
+  - `target_message_skipped_by_chance`: target user sent a message, but the reply chance roll skipped it
+  - `target_message_detected`: trigger user sent a message
+  - `reply_sent`: bot sent a reply
+  - `nickname_changed`: nickname update succeeded
+  - `gemma_reply_generated`: Gemma reply worked
+  - `gemma_reply_failed_fallback_used`: Gemma failed and bot used local fallback
+  - `groq_json_model_failed_fallback_next`: one Groq JSON model failed and the bot is trying the next fallback
+  - `groq_json_fallback_model_succeeded`: a later Groq fallback model succeeded
+  - `gemma_json_fallback_model_succeeded`: Gemma succeeded after Groq JSON models failed
+  - `gif_context_query_generated`: the configured GIF query provider generated the GIPHY search query
+  - `gif_context_query_failed_fallback_used`: GIF query generation failed and the bot used a fallback query
+  - `gif_attempt_failed_retrying`: one GIF attempt failed and the bot is trying another query
+  - `gif_retry_query_generation_failed`: Groq failed to produce a retry query and the bot used static fallback queries
+  - `gif_vision_rerank_failed_title_rerank_used`: visual candidate selection failed and the bot fell back to title/metadata reranking
+  - `gif_candidate_rerank_failed_random_used`: GIF candidate selection failed and the bot picked randomly
+  - `gif_sent`: `!gif` sent a GIPHY result
+  - `gif_command_failed`: GIPHY lookup or send failed
+  - `argue_session_started`: `!argue` identified an argument and sent the opening defense
+  - `argue_opponent_added`: argument mode added a new opponent to an active session
+  - `argue_requester_message_tracked_no_reply`: argument mode tracked the initiator's message without replying
+  - `argue_message_ignored_unrelated`: argument mode ignored a message as unrelated
+  - `argue_message_relevant_no_reply`: argument mode tracked a relevant message without replying
+  - `argue_reply_sent`: argument mode replied to a relevant challenge
+  - `argue_session_ended`: argument mode stopped
+  - `argue_command_failed`: argument mode failed to start or stop cleanly
+  - `mimic_session_started`: mimic mode started and profile examples were loaded
+  - `mimic_profile_updated`: persistent mimic profile summary was refreshed
+  - `mimic_target_message_learned`: mimic mode saved a new message from the real target user
+  - `mimic_reply_sent`: mimic mode sent a disclosed style-simulation reply
+  - `mimic_reply_skipped_by_model`: mimic mode decided not to interrupt the conversation
+  - `mimic_followup_skipped_by_model`: a same-user follow-up bypassed cooldown, but the model judged it should not answer
+  - `mimic_repetitive_reply_retried`: a proposed mimic reply matched a recent bot reply, so the bot asked once for a different answer
+  - `mimic_reply_skipped_repetitive`: the retry was still too repetitive, so the bot stayed quiet
+  - `mimic_direct_reply_missing_model_text`: a direct reply bypassed cooldown, but the model returned no usable text
+  - `mimic_session_stopped`: mimic mode stopped in a channel
+  - `prompt_command_blocked_user_not_whitelisted`: a user tried a command but was not in `DISCORD_USER_WHITELIST_IDS`
+
+## Important Discord settings
+
+In the Discord Developer Portal:
+
+- Enable **Message Content Intent** for the bot.
+- Invite the bot with permissions to read/send messages in your server.
+- Give the bot **Manage Nicknames** permission.
+- Make sure the bot's role is above the target user's highest role, or Discord will block nickname changes.
