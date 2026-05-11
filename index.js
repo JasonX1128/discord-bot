@@ -1890,3 +1890,1157 @@ async function handleActiveArgueSessions(message) {
   return false;
 }
 
+function getMimicSessionKey(channelId) {
+  return channelId;
+}
+
+function getMimicProfilePath(guildId, userId) {
+  return path.join(MIMIC_DATA_DIR_ABSOLUTE, `${guildId}_${userId}.json`);
+}
+
+async function ensureMimicDataDir() {
+  await fs.promises.mkdir(MIMIC_DATA_DIR_ABSOLUTE, { recursive: true });
+}
+
+function createDefaultMimicProfile({ guildId, userId, username, displayName }) {
+  const now = new Date().toISOString();
+  return {
+    schemaVersion: 1,
+    guildId,
+    userId,
+    username,
+    displayName,
+    createdAt: now,
+    updatedAt: now,
+    profileUpdatedAt: null,
+    profileExampleCountAtLastUpdate: 0,
+    profileSummary: "",
+    styleNotes: [],
+    interests: [],
+    recurringPhrases: [],
+    doNotOverdo: [],
+    examplesSinceProfileUpdate: 0,
+    examples: []
+  };
+}
+
+async function loadMimicProfile({ guildId, user, displayName }) {
+  await ensureMimicDataDir();
+
+  const profilePath = getMimicProfilePath(guildId, user.id);
+  let profile = null;
+
+  try {
+    profile = JSON.parse(await fs.promises.readFile(profilePath, "utf8"));
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      logError("mimic_profile_load_failed_new_profile_used", error, {
+        guildId,
+        userId: user.id
+      });
+    }
+  }
+
+  if (!profile || typeof profile !== "object") {
+    profile = createDefaultMimicProfile({
+      guildId,
+      userId: user.id,
+      username: user.username,
+      displayName
+    });
+  }
+
+  profile.guildId = guildId;
+  profile.userId = user.id;
+  profile.username = user.username;
+  profile.displayName = displayName;
+  profile.updatedAt = new Date().toISOString();
+  profile.examples = Array.isArray(profile.examples) ? profile.examples : [];
+  profile.styleNotes = Array.isArray(profile.styleNotes)
+    ? profile.styleNotes
+    : [];
+  profile.interests = Array.isArray(profile.interests) ? profile.interests : [];
+  profile.recurringPhrases = Array.isArray(profile.recurringPhrases)
+    ? profile.recurringPhrases
+    : [];
+  profile.doNotOverdo = Array.isArray(profile.doNotOverdo)
+    ? profile.doNotOverdo
+    : [];
+  profile.examplesSinceProfileUpdate = Number(
+    profile.examplesSinceProfileUpdate ?? 0
+  );
+  const profileExampleCountAtLastUpdate = Number(
+    profile.profileExampleCountAtLastUpdate
+  );
+  profile.profileExampleCountAtLastUpdate = Number.isFinite(
+    profileExampleCountAtLastUpdate
+  )
+    ? profileExampleCountAtLastUpdate
+    : 0;
+
+  return profile;
+}
+
+async function saveMimicProfile(profile) {
+  await ensureMimicDataDir();
+  profile.updatedAt = new Date().toISOString();
+  const profilePath = getMimicProfilePath(profile.guildId, profile.userId);
+  await fs.promises.writeFile(
+    profilePath,
+    `${JSON.stringify(profile, null, 2)}\n`,
+    "utf8"
+  );
+  return profilePath;
+}
+
+function normalizeMimicExampleFromMessage(message) {
+  const content = message.content?.replace(/\s+/g, " ").trim() || "";
+  const attachmentSummary =
+    message.attachments.size > 0
+      ? ` [${message.attachments.size} attachment(s)]`
+      : "";
+  const stickerSummary =
+    message.stickers.size > 0 ? ` [${message.stickers.size} sticker(s)]` : "";
+  const text = `${content}${attachmentSummary}${stickerSummary}`.trim();
+
+  if (!text || text.startsWith("!")) return null;
+
+  return {
+    id: message.id,
+    channelId: message.channel.id,
+    guildId: message.guild?.id ?? "dm",
+    content: text.slice(0, 1200),
+    createdTimestamp: message.createdTimestamp,
+    createdAt: new Date(message.createdTimestamp).toISOString()
+  };
+}
+
+function addMimicExamplesToProfile(profile, messages) {
+  const existingIds = new Set(profile.examples.map((example) => example.id));
+  let addedCount = 0;
+
+  messages.forEach((message) => {
+    const example = normalizeMimicExampleFromMessage(message);
+    if (!example || existingIds.has(example.id)) return;
+
+    profile.examples.push(example);
+    existingIds.add(example.id);
+    addedCount += 1;
+  });
+
+  profile.examples.sort(
+    (a, b) => Number(a.createdTimestamp ?? 0) - Number(b.createdTimestamp ?? 0)
+  );
+  if (profile.examples.length > MIMIC_MAX_EXAMPLES) {
+    profile.examples = profile.examples.slice(-MIMIC_MAX_EXAMPLES);
+  }
+  profile.examplesSinceProfileUpdate += addedCount;
+
+  return addedCount;
+}
+
+async function collectRecentMimicExamples(commandMessage, targetUserId) {
+  const fetchedMessages = await commandMessage.channel.messages.fetch({
+    limit: MIMIC_HISTORY_FETCH_LIMIT
+  });
+
+  return [...fetchedMessages.values()]
+    .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
+    .filter(
+      (recentMessage) =>
+        recentMessage.author.id === targetUserId && !recentMessage.author.bot
+    );
+}
+
+function extractDiscordUserIdFromText(text) {
+  const match = String(text ?? "").match(/<@!?(\d{17,22})>|(\d{17,22})/);
+  return match ? match[1] || match[2] : null;
+}
+
+async function resolveMimicTarget(message, inlineInput) {
+  let targetUser = message.mentions.users.first() ?? null;
+  let referencedMessage = null;
+
+  if (!targetUser && message.reference?.messageId) {
+    referencedMessage = await message.fetchReference().catch(() => null);
+    targetUser = referencedMessage?.author ?? null;
+  }
+
+  if (!targetUser) {
+    const targetUserId = extractDiscordUserIdFromText(inlineInput);
+    if (targetUserId) {
+      targetUser = await client.users.fetch(targetUserId).catch(() => null);
+    }
+  }
+
+  if (!targetUser && message.guild && inlineInput?.trim()) {
+    const normalizedQuery = inlineInput
+      .replace(/<@!?\d{17,22}>/g, "")
+      .trim()
+      .toLowerCase();
+
+    if (normalizedQuery) {
+      const cachedMember = message.guild.members.cache.find((member) => {
+        const displayName = member.displayName?.toLowerCase() ?? "";
+        const username = member.user.username?.toLowerCase() ?? "";
+        return displayName === normalizedQuery || username === normalizedQuery;
+      });
+      targetUser = cachedMember?.user ?? null;
+    }
+  }
+
+  if (!targetUser) {
+    return {
+      error:
+        "Tell me who to mimic with a mention, user ID, exact cached username, or by replying to one of their messages."
+    };
+  }
+
+  if (targetUser.bot) {
+    return { error: "I won't mimic bot accounts." };
+  }
+
+  const targetMember = message.guild
+    ? await message.guild.members.fetch(targetUser.id).catch(() => null)
+    : null;
+  const displayName =
+    targetMember?.displayName || targetUser.globalName || targetUser.username;
+
+  return { user: targetUser, member: targetMember, displayName, referencedMessage };
+}
+
+function normalizeStringArray(value, maxItems = 12) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => String(item).replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .slice(0, maxItems);
+}
+
+function buildMimicProfileUpdatePrompt(profile) {
+  const newExampleCount = Math.max(0, Number(profile.examplesSinceProfileUpdate ?? 0));
+  const newestExamples = profile.examples
+    .slice(-Math.min(Math.max(newExampleCount, 1), 40))
+    .map((example, index) => `${index + 1}. ${example.content}`)
+    .join("\n");
+  const broadExamples = profile.examples
+    .slice(-100)
+    .map((example, index) => `${index + 1}. ${example.content}`)
+    .join("\n");
+  const examplesAtLastUpdate = Number(
+    profile.profileExampleCountAtLastUpdate ?? 0
+  );
+
+  return [
+    "Build or update a persistent Discord style profile from these messages.",
+    "Focus on tone, pacing, humor, interests, recurring phrases, conversational habits, and things to avoid overdoing.",
+    "Be specific about mechanics: typical length, lowercase/all-caps habits, typo/slang density, punctuation, directness, when they joke, and when they sound sincere.",
+    "Do not write generic traits like 'sarcastic and humorous' unless examples strongly support them; explain the exact flavor.",
+    "Treat the previous profile as a provisional hypothesis, not as ground truth.",
+    "If the previous profile was built from only a few examples, revise it aggressively when newer examples contradict it.",
+    "Do not let a small early cluster of weird, prompted, test-like, or uncharacteristic messages dominate the profile once broader evidence exists.",
+    "Newest examples have override priority for correcting stale or bad notes, but use the broader sample to avoid overfitting to one moment.",
+    "Recurring phrases are evidence, not commands. Mark phrases that would sound fake if overused in doNotOverdo.",
+    "Do not infer sensitive traits. Do not include private or identifying secrets.",
+    "Return exactly this JSON shape and nothing else:",
+    "{\"profileSummary\":\"short paragraph\",\"styleNotes\":[\"note\"],\"interests\":[\"topic\"],\"recurringPhrases\":[\"phrase\"],\"doNotOverdo\":[\"warning\"]}",
+    "",
+    `User: ${profile.displayName} (@${profile.username})`,
+    `Total stored examples: ${profile.examples.length}`,
+    `Examples added since last profile update: ${newExampleCount}`,
+    `Examples available at last profile update: ${examplesAtLastUpdate}`,
+    `Previous profile summary: ${profile.profileSummary || "(none)"}`,
+    `Previous style notes: ${profile.styleNotes.join("; ") || "(none)"}`,
+    `Previous interests: ${profile.interests.join("; ") || "(none)"}`,
+    "",
+    "Newest examples since the last update. Use these to correct drift:",
+    newestExamples || "(none)",
+    "",
+    "Broader recent sample, oldest to newest:",
+    broadExamples || "(none)"
+  ].join("\n");
+}
+
+function getMimicProfileUpdateThreshold(profile) {
+  const examplesAtLastUpdate = Number(
+    profile.profileExampleCountAtLastUpdate ?? 0
+  );
+
+  if (
+    !profile.profileSummary ||
+    examplesAtLastUpdate < MIMIC_UNSTABLE_PROFILE_EXAMPLE_COUNT
+  ) {
+    return 1;
+  }
+
+  if (profile.examples.length < MIMIC_EARLY_PROFILE_EXAMPLE_COUNT) {
+    return MIMIC_EARLY_PROFILE_UPDATE_EXAMPLE_COUNT;
+  }
+
+  return MIMIC_PROFILE_UPDATE_EXAMPLE_COUNT;
+}
+
+async function refreshMimicProfile(
+  profile,
+  { force = false, reason = null } = {}
+) {
+  const updateThreshold = getMimicProfileUpdateThreshold(profile);
+
+  if (
+    !force &&
+    (profile.profileSummary || profile.styleNotes.length > 0) &&
+    profile.examplesSinceProfileUpdate < updateThreshold
+  ) {
+    return profile;
+  }
+
+  if (profile.examples.length < 3) {
+    return profile;
+  }
+
+  try {
+    const parsed = await callGroqJson({
+      model: MIMIC_MODEL,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You summarize Discord writing style for a disclosed mimic bot. Return only strict JSON."
+        },
+        {
+          role: "user",
+          content: buildMimicProfileUpdatePrompt(profile)
+        }
+      ],
+      temperature: 0.2,
+      maxTokens: 700,
+      timeoutMs: 12_000
+    });
+
+    profile.profileSummary =
+      asStringOrNull(parsed.profileSummary) || profile.profileSummary || "";
+    profile.styleNotes = normalizeStringArray(parsed.styleNotes, 14);
+    profile.interests = normalizeStringArray(parsed.interests, 14);
+    profile.recurringPhrases = normalizeStringArray(
+      parsed.recurringPhrases,
+      12
+    );
+    profile.doNotOverdo = normalizeStringArray(parsed.doNotOverdo, 10);
+    profile.examplesSinceProfileUpdate = 0;
+    profile.profileUpdatedAt = new Date().toISOString();
+    profile.profileExampleCountAtLastUpdate = profile.examples.length;
+
+    logEvent("mimic_profile_updated", {
+      guildId: profile.guildId,
+      userId: profile.userId,
+      displayName: profile.displayName,
+      exampleCount: profile.examples.length,
+      profileExampleCountAtLastUpdate: profile.profileExampleCountAtLastUpdate,
+      updateThreshold,
+      force,
+      reason,
+      model: MIMIC_MODEL
+    });
+  } catch (error) {
+    logError("mimic_profile_update_failed", error, {
+      guildId: profile.guildId,
+      userId: profile.userId,
+      displayName: profile.displayName,
+      exampleCount: profile.examples.length,
+      updateThreshold,
+      force,
+      reason,
+      model: MIMIC_MODEL
+    });
+  }
+
+  return profile;
+}
+
+function tokenizeForSimilarity(text) {
+  return new Set(
+    String(text ?? "")
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter((token) => token.length > 2)
+  );
+}
+
+function selectMimicStyleExamples(profile, contextText, limit = 12) {
+  const contextTokens = tokenizeForSimilarity(contextText);
+
+  return profile.examples
+    .map((example, index) => {
+      const exampleTokens = tokenizeForSimilarity(example.content);
+      let overlap = 0;
+      exampleTokens.forEach((token) => {
+        if (contextTokens.has(token)) overlap += 1;
+      });
+
+      return {
+        example,
+        score: overlap * 10 + index / Math.max(profile.examples.length, 1)
+      };
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map(({ example }) => example)
+    .sort(
+      (a, b) => Number(a.createdTimestamp ?? 0) - Number(b.createdTimestamp ?? 0)
+    );
+}
+
+function trimMimicMemoryText(text, maxChars = 700) {
+  const normalized = String(text ?? "").replace(/\s+/g, " ").trim();
+  if (!normalized) return "(empty)";
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxChars - 3)).trim()}...`;
+}
+
+function ensureMimicSessionMemory(session) {
+  if (!Array.isArray(session.recentExchanges)) {
+    session.recentExchanges = [];
+  }
+
+  if (!(session.recentRepliesByUserId instanceof Map)) {
+    session.recentRepliesByUserId = new Map();
+  }
+}
+
+function buildMimicRecentExchangeTranscript(session, currentMessage) {
+  ensureMimicSessionMemory(session);
+
+  if (session.recentExchanges.length === 0) {
+    return "(none)";
+  }
+
+  return session.recentExchanges
+    .slice(-MIMIC_RECENT_EXCHANGE_LIMIT)
+    .map((exchange, index) => {
+      const labels = [];
+      if (exchange.triggerUserId === currentMessage.author.id) {
+        labels.push("same user");
+      }
+      if (exchange.directMimicReply) labels.push("direct reply");
+      if (exchange.followupToPrevious) labels.push("follow-up");
+      const labelText =
+        labels.length > 0 ? ` [${labels.join(", ")}]` : "";
+
+      return [
+        `${index + 1}.${labelText} ${exchange.triggerUserName}: ${trimMimicMemoryText(
+          exchange.triggerText,
+          360
+        )}`,
+        `   bot as ${session.targetDisplayName}: ${trimMimicMemoryText(
+          exchange.replyText,
+          360
+        )}`
+      ].join("\n");
+    })
+    .join("\n");
+}
+
+function getRecentMimicReplyForUser(session, userId, now = Date.now()) {
+  ensureMimicSessionMemory(session);
+
+  const exchange = session.recentRepliesByUserId.get(userId);
+  if (!exchange) return null;
+
+  if (now - Number(exchange.ts ?? 0) > MIMIC_FOLLOWUP_WINDOW_MS) {
+    session.recentRepliesByUserId.delete(userId);
+    return null;
+  }
+
+  return exchange;
+}
+
+function rememberMimicExchange({
+  session,
+  triggerMessage,
+  replyText,
+  sentMessage,
+  directMimicReply = false,
+  followupToPrevious = false,
+  reason = null
+}) {
+  ensureMimicSessionMemory(session);
+
+  const exchange = {
+    ts: Date.now(),
+    triggerUserId: triggerMessage.author.id,
+    triggerUserName: getMessageAuthorLabel(triggerMessage),
+    triggerMessageId: triggerMessage.id,
+    triggerText: getArgumentMessageSummary(triggerMessage),
+    replyMessageId: sentMessage.id,
+    replyText: trimMimicMemoryText(replyText, MIMIC_REPLY_MAX_CHARS),
+    directMimicReply,
+    followupToPrevious,
+    reason: asStringOrNull(reason)
+  };
+
+  session.recentExchanges.push(exchange);
+  if (session.recentExchanges.length > MIMIC_RECENT_EXCHANGE_LIMIT) {
+    session.recentExchanges = session.recentExchanges.slice(
+      -MIMIC_RECENT_EXCHANGE_LIMIT
+    );
+  }
+
+  session.recentRepliesByUserId.set(triggerMessage.author.id, exchange);
+  return exchange;
+}
+
+async function buildMimicConversationContext(
+  message,
+  referencedMimicBotMessage = null,
+  session = null,
+  recentUserFollowup = null
+) {
+  const fetchedMessages = await message.channel.messages.fetch({
+    before: message.id,
+    limit: Math.max(0, MIMIC_CONTEXT_MESSAGE_LIMIT - 1)
+  });
+  const messages = [...fetchedMessages.values(), message]
+    .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
+    .filter((recentMessage) => !recentMessage.author.bot);
+  const currentMessageText = getArgumentMessageSummary(message);
+  const currentMessageUsesNonEnglishScript =
+    containsNonEnglishScriptText(currentMessageText);
+  const transcriptUsesNonEnglishScript = messages.some((recentMessage) =>
+    containsNonEnglishScriptText(getArgumentMessageSummary(recentMessage))
+  );
+
+  return {
+    messageCount: messages.length,
+    currentMessageUsesNonEnglishScript,
+    transcriptUsesNonEnglishScript,
+    transcript:
+      messages
+        .map((recentMessage, index) => {
+          const labels = [];
+          if (recentMessage.id === message.id) labels.push("[NEW]");
+          const labelText = labels.length > 0 ? ` ${labels.join(" ")}` : "";
+          return `${index + 1}.${labelText} ${getMessageAuthorLabel(
+            recentMessage
+          )}: ${getArgumentMessageSummary(recentMessage)}`;
+        })
+        .join("\n") || "No recent human messages.",
+    plainText: messages
+      .map((recentMessage) => getArgumentMessageSummary(recentMessage))
+      .join("\n"),
+    referencedMimicBotMessage,
+    recentUserFollowup,
+    currentAuthorIsTarget:
+      session?.targetUserId === message.author.id,
+    recentExchangeTranscript: session
+      ? buildMimicRecentExchangeTranscript(session, message)
+      : "(none)"
+  };
+}
+
+async function getReferencedMimicBotMessage(message, session) {
+  if (!message.reference?.messageId) return null;
+
+  const referencedMessage = await message.fetchReference().catch(() => null);
+  if (!referencedMessage || referencedMessage.author.id !== client.user.id) {
+    return null;
+  }
+
+  const knownMimicMessage =
+    session.mimicReplyMessageIds?.has(referencedMessage.id) ?? false;
+  const hasMimicPrefix = referencedMessage.content?.startsWith(
+    getMimicDisclosurePrefix(session.targetDisplayName)
+  );
+
+  return knownMimicMessage || hasMimicPrefix ? referencedMessage : null;
+}
+
+function messageLooksLikeMimicTrigger(message, session) {
+  const content = message.content?.toLowerCase() ?? "";
+  const displayName = session.targetDisplayName.toLowerCase();
+  const username = session.targetUsername.toLowerCase();
+
+  return (
+    message.mentions.users.has(session.targetUserId) ||
+    contentIncludesTerm(content, displayName) ||
+    contentIncludesTerm(content, username) ||
+    /\b(what would|where is|someone ask|any thoughts|thoughts)\b/i.test(
+      content
+    )
+  );
+}
+
+function buildMimicDecisionPrompt({
+  session,
+  profile,
+  context,
+  examples,
+  extraInstruction = null
+}) {
+  const prefix = getMimicDisclosurePrefix(session.targetDisplayName);
+  const referencedMimicBotMessage = context.referencedMimicBotMessage;
+  const recentUserFollowup = context.recentUserFollowup;
+
+  return [
+    "You are a disclosed Discord style-simulation engine.",
+    `The bot may post a message prefixed with ${JSON.stringify(prefix)}.`,
+    "Never claim to be the real person, never imply the real person said this, and never reveal private facts.",
+    "Decide whether a simulated contribution would naturally help the active conversation.",
+    "Reply only when there is an active conversational opening: a question, direct prompt, joke setup, disagreement, or a moment where this user's style would add something.",
+    "Have some agency: if replying, make a fresh conversational move. React, answer, tease, disagree, ask a short follow-up, or add a relevant opinion the target user might plausibly add.",
+    "Do not merely retrieve an old example, summarize the chat, or parrot a catchphrase. Style examples are evidence, not templates.",
+    "Tone fit matters more than topic fit: match their usual brevity, lowercase/all-caps habits, typo/slang density, punctuation, directness, and emotional intensity.",
+    "Use at most one recurring phrase or slang marker, and only if it fits naturally. Never force 'bro', 'holy slop', or any other phrase just because it appears in examples.",
+    "Avoid generic assistant diction, complete explanatory sentences, and polished corporate tone.",
+    "Do not reproduce hateful or protected-class insults from examples; keep the target's vibe without copying that content.",
+    referencedMimicBotMessage
+      ? "The newest message is directly replying to the previous mimic-bot message shown below. Treat this as a direct prompt and answer it in the target user's style."
+      : "No direct reply to a previous mimic-bot message is present.",
+    recentUserFollowup
+      ? "The newest message is from a user the mimic bot recently answered. Treat it as a continuing thread or multi-message request from that same user, even if Discord did not mark it as a reply."
+      : "No recent same-user follow-up to a mimic-bot answer is present.",
+    context.currentAuthorIsTarget
+      ? "The newest message is from the real target user being simulated. You may still reply to them as a normal participant; do not ignore them just because they are the target."
+      : "The newest message is not from the real target user.",
+    context.currentMessageUsesNonEnglishScript
+      ? "The newest message uses a non-English script. Understand it directly and usually reply in the same language/script unless the target user's style clearly code-switches."
+      : "The newest message does not appear to use a non-English script.",
+    "Do not answer multilingual messages with generic English filler just because you are uncertain. If a message asks a clear question in Chinese or another language, answer that question in a natural version of the target user's style.",
+    "Use the recent mimic-bot exchanges as memory of what the bot has already said. Continue the conversation coherently, avoid contradicting yourself, and do not repeat the same joke or answer.",
+    "If the same user is asking follow-up questions across multiple messages, answer the newest message while preserving the thread from the prior bot answer.",
+    extraInstruction
+      ? `Correction for this attempt: ${extraInstruction}`
+      : "No additional correction for this attempt.",
+    "Do not ramble, do not monologue, do not reply just because messages exist, and do not answer bot messages.",
+    "The real target user may be part of the conversation. Treat their messages like anyone else's while being careful not to claim the bot is the real user.",
+    `If replying, keep it under ${MIMIC_REPLY_MAX_CHARS} characters before the disclosure prefix.`,
+    "Before returning, silently revise the reply until it is both original and recognizably in the target's tone.",
+    "Return exactly this JSON shape and nothing else:",
+    "{\"shouldReply\":true,\"confidence\":0.75,\"styleFit\":0.85,\"originality\":0.8,\"reply\":\"short message\",\"reason\":\"short reason\"}",
+    "",
+    `Target user to stylistically simulate: ${profile.displayName} (@${profile.username}) [id=${profile.userId}]`,
+    `Newest message uses non-English script: ${context.currentMessageUsesNonEnglishScript ? "yes" : "no"}`,
+    `Recent transcript uses non-English script: ${context.transcriptUsesNonEnglishScript ? "yes" : "no"}`,
+    `Persistent profile: ${profile.profileSummary || "(not enough data yet)"}`,
+    `Style notes: ${profile.styleNotes.join("; ") || "(none)"}`,
+    `Interests: ${profile.interests.join("; ") || "(none)"}`,
+    `Recurring phrases: ${profile.recurringPhrases.join("; ") || "(none)"}`,
+    `Do not overdo: ${profile.doNotOverdo.join("; ") || "(none)"}`,
+    "",
+    "Style evidence from this user. Do not copy these lines directly:",
+    examples.map((example, index) => `${index + 1}. ${example.content}`).join("\n") ||
+      "(few examples available; be cautious and generic)",
+    "",
+    "Previous mimic-bot message being replied to:",
+    referencedMimicBotMessage
+      ? referencedMimicBotMessage.content.slice(0, 1200)
+      : "(none)",
+    "",
+    "Most recent mimic-bot reply to this same user:",
+    recentUserFollowup
+      ? [
+          `${recentUserFollowup.triggerUserName}: ${trimMimicMemoryText(
+            recentUserFollowup.triggerText,
+            500
+          )}`,
+          `bot as ${session.targetDisplayName}: ${trimMimicMemoryText(
+            recentUserFollowup.replyText,
+            500
+          )}`
+        ].join("\n")
+      : "(none)",
+    "",
+    "Recent mimic-bot exchanges in this channel, oldest to newest:",
+    context.recentExchangeTranscript || "(none)",
+    "",
+    "Recent conversation, oldest to newest:",
+    context.transcript
+  ].join("\n");
+}
+
+function normalizeMimicReplyText(text) {
+  const normalized = String(text ?? "")
+    .replace(/^\[mimic:[^\]]+\]\s*/i, "")
+    .replace(/<@!?\d+>/g, "")
+    .replace(/@everyone/gi, "everyone")
+    .replace(/@here/gi, "here")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!normalized) return null;
+  if (normalized.length <= MIMIC_REPLY_MAX_CHARS) return normalized;
+  return `${normalized.slice(0, MIMIC_REPLY_MAX_CHARS - 3).trim()}...`;
+}
+
+function getMimicDisclosurePrefix(displayName) {
+  const prefix = MIMIC_DISCLOSURE_PREFIX.replace("{name}", displayName).trim();
+  return prefix ? `${prefix} ` : "";
+}
+
+function formatMimicReply(session, replyText) {
+  const prefix = getMimicDisclosurePrefix(session.targetDisplayName);
+  return `${prefix}${replyText}`.slice(0, 2000);
+}
+
+function normalizeMimicRepetitionText(text) {
+  return String(text ?? "")
+    .replace(/^\[mimic:[^\]]+\]\s*/i, "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isMimicReplyRepetitive(session, replyText) {
+  ensureMimicSessionMemory(session);
+
+  const candidate = normalizeMimicRepetitionText(replyText);
+  if (candidate.length < 3) return false;
+  const candidateTokens = new Set(candidate.split(/\s+/).filter(Boolean));
+
+  return session.recentExchanges
+    .slice(-MIMIC_RECENT_EXCHANGE_LIMIT)
+    .some((exchange) => {
+      const previous = normalizeMimicRepetitionText(exchange.replyText);
+      if (!previous) return false;
+      if (candidate === previous) return true;
+
+      const previousTokens = new Set(previous.split(/\s+/).filter(Boolean));
+      if (candidateTokens.size === 0 || previousTokens.size === 0) return false;
+
+      let shared = 0;
+      candidateTokens.forEach((token) => {
+        if (previousTokens.has(token)) shared += 1;
+      });
+
+      const unionSize = new Set([...candidateTokens, ...previousTokens]).size;
+      const overlap = unionSize > 0 ? shared / unionSize : 0;
+      return candidate.length <= 80 && previous.length <= 80 && overlap >= 0.8;
+    });
+}
+
+function selectMimicDecisionModel(context) {
+  return context.currentMessageUsesNonEnglishScript
+    ? MIMIC_MULTILINGUAL_MODEL
+    : MIMIC_MODEL;
+}
+
+async function generateMimicDecision({
+  session,
+  profile,
+  context,
+  extraInstruction = null
+}) {
+  const examples = selectMimicStyleExamples(profile, context.plainText, 12);
+  const model = selectMimicDecisionModel(context);
+  const parsed = await callGroqJson({
+    model,
+    messages: [
+      {
+        role: "system",
+        content:
+          "You decide whether a disclosed multilingual mimic bot should contribute to Discord chat. Return only strict JSON."
+      },
+      {
+        role: "user",
+        content: buildMimicDecisionPrompt({
+          session,
+          profile,
+          context,
+          examples,
+          extraInstruction
+        })
+      }
+    ],
+    temperature: MIMIC_TEMPERATURE,
+    maxTokens: 500,
+    timeoutMs: 12_000
+  });
+
+  return {
+    shouldReply: parseModelBoolean(parsed.shouldReply),
+    confidence: parseModelConfidence(parsed.confidence),
+    styleFit:
+      parsed.styleFit === undefined ? 0.7 : parseModelConfidence(parsed.styleFit),
+    originality:
+      parsed.originality === undefined
+        ? 0.7
+        : parseModelConfidence(parsed.originality),
+    reply: normalizeMimicReplyText(parsed.reply),
+    reason: asStringOrNull(parsed.reason),
+    provider: getLlmMeta(parsed).provider ?? "groq",
+    model: getLlmMeta(parsed).model ?? model
+  };
+}
+
+async function startMimicSession(message) {
+  const inlineInput = parseMimicCommandInput(message.content);
+  const target = await resolveMimicTarget(message, inlineInput);
+
+  if (target.error) {
+    await message.reply({
+      content: target.error,
+      allowedMentions: { parse: [], repliedUser: false }
+    });
+    return;
+  }
+
+  const guildId = message.guild?.id ?? "dm";
+  const profile = await loadMimicProfile({
+    guildId,
+    user: target.user,
+    displayName: target.displayName
+  });
+  const recentExamples = await collectRecentMimicExamples(
+    message,
+    target.user.id
+  );
+  const addedExampleCount = addMimicExamplesToProfile(profile, recentExamples);
+  const forceProfileRefresh =
+    !profile.profileSummary ||
+    addedExampleCount >= MIMIC_EARLY_PROFILE_UPDATE_EXAMPLE_COUNT;
+  await refreshMimicProfile(profile, {
+    force: forceProfileRefresh,
+    reason: "mimic_session_start"
+  });
+  const profilePath = await saveMimicProfile(profile);
+
+  const session = {
+    guildId,
+    channelId: message.channel.id,
+    targetUserId: target.user.id,
+    targetUsername: target.user.username,
+    targetDisplayName: target.displayName,
+    startedByUserId: message.author.id,
+    startedAt: Date.now(),
+    lastReplyAt: 0,
+    mimicReplyMessageIds: new Set(),
+    recentExchanges: [],
+    recentRepliesByUserId: new Map(),
+    profilePath
+  };
+
+  activeMimicSessions.set(getMimicSessionKey(message.channel.id), session);
+
+  logEvent("mimic_session_started", {
+    guildId,
+    channelId: message.channel.id,
+    targetUserId: target.user.id,
+    targetDisplayName: target.displayName,
+    startedByUserId: message.author.id,
+    addedExampleCount,
+    storedExampleCount: profile.examples.length,
+    profilePath
+  });
+
+  await message.reply({
+    content: `Mimic mode started for \`${target.displayName}\` in this channel. I will label generated replies with \`${getMimicDisclosurePrefix(
+      target.displayName
+    ).trim()}\`. Stored ${profile.examples.length} example(s) in \`${MIMIC_DATA_DIR}\`.`,
+    allowedMentions: { parse: [], repliedUser: false }
+  });
+}
+
+async function stopMimicSession(message) {
+  const key = getMimicSessionKey(message.channel.id);
+  const session = activeMimicSessions.get(key);
+
+  if (!session) {
+    await message.reply({
+      content: "Mimic mode is not active in this channel.",
+      allowedMentions: { parse: [], repliedUser: false }
+    });
+    return;
+  }
+
+  const inlineInput = parseUnmimicCommandInput(message.content);
+  const requestedUserId = extractDiscordUserIdFromText(inlineInput);
+  if (requestedUserId && requestedUserId !== session.targetUserId) {
+    await message.reply({
+      content: `Mimic mode is active for \`${session.targetDisplayName}\`, not that user.`,
+      allowedMentions: { parse: [], repliedUser: false }
+    });
+    return;
+  }
+
+  activeMimicSessions.delete(key);
+  logEvent("mimic_session_stopped", {
+    guildId: session.guildId,
+    channelId: session.channelId,
+    targetUserId: session.targetUserId,
+    targetDisplayName: session.targetDisplayName,
+    stoppedByUserId: message.author.id
+  });
+
+  await message.reply({
+    content: `Mimic mode stopped for \`${session.targetDisplayName}\`. Stored profile data stays in \`${MIMIC_DATA_DIR}\`.`,
+    allowedMentions: { parse: [], repliedUser: false }
+  });
+}
+
+async function learnFromMimicTargetMessage(session, message) {
+  const profile = await loadMimicProfile({
+    guildId: session.guildId,
+    user: message.author,
+    displayName: getMessageAuthorName(message)
+  });
+  const addedCount = addMimicExamplesToProfile(profile, [message]);
+  if (addedCount > 0) {
+    await refreshMimicProfile(profile, {
+      reason: "target_message_learned"
+    });
+    await saveMimicProfile(profile);
+    logEvent("mimic_target_message_learned", {
+      guildId: session.guildId,
+      channelId: session.channelId,
+      targetUserId: session.targetUserId,
+      targetDisplayName: session.targetDisplayName,
+      addedCount,
+      storedExampleCount: profile.examples.length
+    });
+  }
+}
+
+async function handleActiveMimicSession(message) {
+  if (!ENABLE_MIMIC_COMMAND || !MIMIC_AUTO_REPLY_ENABLED) return false;
+
+  const session = activeMimicSessions.get(getMimicSessionKey(message.channel.id));
+  if (!session) return false;
+
+  const currentAuthorIsTarget = message.author.id === session.targetUserId;
+
+  if (currentAuthorIsTarget) {
+    await learnFromMimicTargetMessage(session, message).catch((error) => {
+      logError("mimic_target_learning_failed", error, {
+        guildId: session.guildId,
+        channelId: session.channelId,
+        targetUserId: session.targetUserId
+      });
+    });
+  }
+
+  const referencedMimicBotMessage = await getReferencedMimicBotMessage(
+    message,
+    session
+  );
+  const isDirectMimicReply = Boolean(referencedMimicBotMessage);
+  const recentUserFollowup = getRecentMimicReplyForUser(
+    session,
+    message.author.id
+  );
+  const isRecentUserFollowup = Boolean(recentUserFollowup);
+  const isDirectTrigger =
+    isDirectMimicReply ||
+    isRecentUserFollowup ||
+    messageLooksLikeMimicTrigger(message, session);
+  const cooldownRemainingMs =
+    MIMIC_REPLY_COOLDOWN_MS - (Date.now() - session.lastReplyAt);
+  if (!isDirectTrigger && cooldownRemainingMs > 0) {
+    logEvent("mimic_reply_skipped_cooldown", {
+      guildId: session.guildId,
+      channelId: session.channelId,
+      targetUserId: session.targetUserId,
+      currentAuthorIsTarget,
+      cooldownRemainingMs
+    });
+    return false;
+  }
+
+  let profile;
+  let context;
+  let decision;
+  try {
+    profile = await loadMimicProfile({
+      guildId: session.guildId,
+      user: {
+        id: session.targetUserId,
+        username: session.targetUsername
+      },
+      displayName: session.targetDisplayName
+    });
+    context = await buildMimicConversationContext(
+      message,
+      referencedMimicBotMessage,
+      session,
+      recentUserFollowup
+    );
+    decision = await generateMimicDecision({ session, profile, context });
+  } catch (error) {
+    logError("mimic_decision_failed", error, {
+      guildId: session.guildId,
+      channelId: session.channelId,
+      targetUserId: session.targetUserId,
+      model: MIMIC_MODEL
+    });
+    return false;
+  }
+
+  if (decision.reply && isMimicReplyRepetitive(session, decision.reply)) {
+    const repeatedReply = decision.reply;
+    try {
+      decision = await generateMimicDecision({
+        session,
+        profile,
+        context,
+        extraInstruction: `The proposed reply ${JSON.stringify(
+          repeatedReply
+        )} is too similar to a recent mimic-bot reply. Choose a different, context-specific response, or set shouldReply to false if there is no good response.`
+      });
+
+      logEvent("mimic_repetitive_reply_retried", {
+        guildId: session.guildId,
+        channelId: session.channelId,
+        targetUserId: session.targetUserId,
+        repeatedReply,
+        replacementReply: decision.reply,
+        model: decision.model,
+        provider: decision.provider
+      });
+    } catch (error) {
+      logError("mimic_repetitive_reply_retry_failed", error, {
+        guildId: session.guildId,
+        channelId: session.channelId,
+        targetUserId: session.targetUserId,
+        repeatedReply,
+        model: MIMIC_MODEL
+      });
+    }
+  }
+
+  if (decision.reply && isMimicReplyRepetitive(session, decision.reply)) {
+    logEvent("mimic_reply_skipped_repetitive", {
+      guildId: session.guildId,
+      channelId: session.channelId,
+      targetUserId: session.targetUserId,
+      currentAuthorIsTarget,
+      reply: decision.reply,
+      confidence: decision.confidence,
+      styleFit: decision.styleFit,
+      originality: decision.originality,
+      reason: decision.reason,
+      model: decision.model,
+      provider: decision.provider,
+      contextMessageCount: context.messageCount
+    });
+    return false;
+  }
+
+  if (
+    !isDirectMimicReply &&
+    !isRecentUserFollowup &&
+    (!decision.shouldReply ||
+      decision.confidence < 0.55 ||
+      decision.styleFit < MIMIC_STYLE_MATCH_MIN ||
+      decision.originality < MIMIC_ORIGINALITY_MIN ||
+      !decision.reply)
+  ) {
+    logEvent("mimic_reply_skipped_by_model", {
+      guildId: session.guildId,
+      channelId: session.channelId,
+      targetUserId: session.targetUserId,
+      currentAuthorIsTarget,
+      confidence: decision.confidence,
+      styleFit: decision.styleFit,
+      originality: decision.originality,
+      reason: decision.reason,
+      model: decision.model,
+      provider: decision.provider,
+      contextMessageCount: context.messageCount
+    });
+    return false;
+  }
+
+  if (
+    isRecentUserFollowup &&
+    !isDirectMimicReply &&
+    (!decision.shouldReply ||
+      decision.confidence < 0.45 ||
+      decision.styleFit < MIMIC_STYLE_MATCH_MIN ||
+      decision.originality < MIMIC_ORIGINALITY_MIN ||
+      !decision.reply)
+  ) {
+    logEvent("mimic_followup_skipped_by_model", {
+      guildId: session.guildId,
+      channelId: session.channelId,
+      targetUserId: session.targetUserId,
+      currentAuthorIsTarget,
+      followupUserId: message.author.id,
+      previousReplyMessageId: recentUserFollowup.replyMessageId,
+      confidence: decision.confidence,
+      styleFit: decision.styleFit,
+      originality: decision.originality,
+      reason: decision.reason,
+      model: decision.model,
+      provider: decision.provider,
+      contextMessageCount: context.messageCount
+    });
+    return false;
+  }
+
+  if (isDirectMimicReply) {
+    if (!decision.reply) {
+      logEvent("mimic_direct_reply_missing_model_text", {
+        guildId: session.guildId,
+        channelId: session.channelId,
+        targetUserId: session.targetUserId,
+        currentAuthorIsTarget,
+        confidence: decision.confidence,
+        reason: decision.reason,
+        model: decision.model,
+        provider: decision.provider
+      });
+      return false;
+    }
+
+    decision.shouldReply = true;
+    decision.confidence = Math.max(decision.confidence, 0.95);
+    decision.styleFit = Math.max(decision.styleFit, MIMIC_STYLE_MATCH_MIN);
+    decision.originality = Math.max(
+      decision.originality,
+      MIMIC_ORIGINALITY_MIN
+    );
+  }
+
+  try {
+    await message.channel.sendTyping().catch(() => null);
+    const sentMessage = await message.channel.send({
+      content: formatMimicReply(session, decision.reply),
+      allowedMentions: { parse: [] }
+    });
+    session.mimicReplyMessageIds.add(sentMessage.id);
+    rememberMimicExchange({
+      session,
+      triggerMessage: message,
+      replyText: decision.reply,
+      sentMessage,
+      directMimicReply: isDirectMimicReply,
+      followupToPrevious: isRecentUserFollowup,
+      reason: decision.reason
+    });
+    session.lastReplyAt = Date.now();
+    logEvent("mimic_reply_sent", {
+      guildId: session.guildId,
+      channelId: session.channelId,
+      targetUserId: session.targetUserId,
+      directMimicReply: isDirectMimicReply,
+      followupToPrevious: isRecentUserFollowup,
+      followupUserId: isRecentUserFollowup ? message.author.id : null,
+      currentAuthorIsTarget,
+      confidence: decision.confidence,
+      styleFit: decision.styleFit,
+      originality: decision.originality,
+      reason: decision.reason,
+      model: decision.model,
+      provider: decision.provider
+    });
+    return true;
+  } catch (error) {
+    logError("mimic_reply_send_failed", error, {
+      guildId: session.guildId,
+      channelId: session.channelId,
+      targetUserId: session.targetUserId
+    });
+    return false;
+  }
+}
+

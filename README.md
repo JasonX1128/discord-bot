@@ -172,3 +172,25 @@ While active, the bot classifies each new channel message. It responds only when
 
 The bot never replies to the user who started `!argue`; it only tracks their messages as context. If another user clearly joins the argument, the bot adds them to the opponent list and announces the updated names in-channel. During an active session, direct insults aimed at `jason`, `json`, or `jsn` are treated as argumentative and force a response.
 
+## Mimic command
+
+Set `ENABLE_MIMIC_COMMAND=true` and make sure `GROQ_API_KEY` is configured.
+
+- Send `!mimic @user` to start disclosed style mimicry for that user in the current channel.
+- Send `!mimic` as a reply to one of someone's messages to mimic that message's author.
+- Send `!unmimic` to stop mimic mode in the current channel.
+
+When mimic mode starts, the bot scans recent channel messages from the target user, stores examples and a rolling style profile in `MIMIC_DATA_DIR`, and keeps that data across `!unmimic`/`!mimic` cycles. While active, it keeps learning from real messages by the target user.
+
+The profile updater is intentionally aggressive while a profile is young. If the first summary was built from only a few messages, each new real message can trigger a rewrite; after the profile has a broader sample, updates slow down to the normal `MIMIC_PROFILE_UPDATE_EXAMPLE_COUNT` cadence. The profile prompt treats old summaries as provisional so a few uncharacteristic starter messages do not permanently define the user.
+
+Mimic replies are always visibly labeled with `MIMIC_DISCLOSURE_PREFIX`; the bot does not silently impersonate the real user. It only replies when the model decides there is an active conversational opening, and it ignores bot messages so it does not ramble to itself. Messages from the mimicked user are learned from and then evaluated like anyone else's, so the bot can interact with the person it is mimicking too.
+
+The mimic prompt treats stored examples as style evidence, not templates. It asks the model to make a fresh conversational move, then self-rate tone fit and originality before sending. If the style or originality scores are too low, the bot stays quiet instead of parroting a past line.
+
+While a mimic session is active, the bot also remembers its own recent mimic replies in memory. Those exchanges are included in later prompts so it can avoid repeating itself, carry forward what it just said, and handle multi-message follow-ups from a user it recently answered.
+
+For multilingual chat, mimic mode routes messages written in non-English scripts, including Chinese, to `MIMIC_MULTILINGUAL_MODEL` and tells the model to understand and usually answer in the same language/script. It also retries once if the proposed reply is too similar to one it recently sent, then skips rather than posting the same line again.
+
+If someone replies directly to one of the bot's mimic messages, that bypasses `MIMIC_REPLY_COOLDOWN_MS`; the bot treats the reply as a direct prompt and answers as the mimicked user with the disclosure prefix. If the same user sends another message within `MIMIC_FOLLOWUP_WINDOW_MS`, the bot treats it as a possible continuation of that exchange and can answer without waiting for the normal cooldown.
+
