@@ -103,11 +103,19 @@ Copy `.env.example` to `.env`, then set:
 npm start
 ```
 
+## Project Structure
+
+- `index.js`: Discord client startup, event routing, permission checks, and top-level command flow
+- `src/config.js`: environment parsing and startup validation
+- `src/llm.js`: Groq/Gemma JSON helpers and fallback handling
+- `src/features/`: feature-specific handlers for replies, GIFs, argument mode, mimic mode, and nickname sync
+- `src/utils.js`: shared Discord message and model-response helpers
+
 ## Customize the reply list
 
 Edit `messages.json` and change the `messages` array.
 
-If `USE_GEMMA=true`, the bot sends the target user's latest message + style examples from `messages.json` to Gemma to generate contextual replies.  
+If `USE_GEMMA=true`, the bot sends the target user's latest message + style examples from `messages.json` to Gemma to generate contextual replies.
 If the API fails, it falls back to `messages.json`.
 
 ## Testing without waiting
