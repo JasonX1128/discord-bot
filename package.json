@@ -1,0 +1,14 @@
+{
+  "name": "discord-random-reply-bot",
+  "version": "1.0.0",
+  "description": "Replies with a random message whenever a specific user sends a message.",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "dotenv": "^16.4.5"
+  }
+}
